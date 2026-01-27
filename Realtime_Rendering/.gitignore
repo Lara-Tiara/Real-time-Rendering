@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# CLion / JetBrains
+.idea/
+*.iml
+
+# CMake build folders
+cmake-build-*/
+build*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Ninja / compilation database
+.ninja_*
+compile_commands.json
+
+# Binaries / objects
+*.o
+*.a
+*.so
+*.dylib
+*.exe
