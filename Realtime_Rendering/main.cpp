@@ -1,6 +1,4 @@
-// main.cpp
-// Loads a teapot (glTF/GLB) with Assimp, renders it 3 times side-by-side using:
-// 0 = Blinn-Phong, 1 = Toon, 2 = Oren-Nayar (no textures)
+// 0 = Blinn-Phong, 1 = Toon, 2 = Oren-Nayar, 3 = Cook-Torrance
 
 #include <iostream>
 #include <vector>
@@ -8,9 +6,15 @@
 #include <string>
 #include <cfloat>
 #include <cmath>
+#include <algorithm>
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
+
+#include "imgui.h"
+#include "backends/imgui_impl_glfw.h"
+#include "backends/imgui_impl_opengl3.h"
+
 
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
@@ -70,8 +74,6 @@ static glm::vec3 aiToGlm(const aiVector3D& v) {
     return glm::vec3(v.x, v.y, v.z);
 }
 
-// Loads *all* meshes and merges them into one vertex/index buffer.
-// Uses PreTransformVertices so node transforms are baked (good for static scenes).
 static void loadMergedMeshesAssimp(
     const std::string& path,
     std::vector<Vertex>& outVertices,
@@ -145,13 +147,12 @@ int main() {
         return -1;
     }
 
-    // macOS OpenGL 3.3 core
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 
-    GLFWwindow* window = glfwCreateWindow(1100, 720, "3 Teapots: Blinn-Phong / Toon / Oren-Nayar", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1400, 720, "4 Teapots: Blinn-Phong / Toon / Oren-Nayar / Cook-Torrance", nullptr, nullptr);
     if (!window) {
         std::cerr << "Failed to create GLFW window\n";
         glfwTerminate();
@@ -170,8 +171,17 @@ int main() {
 
     glEnable(GL_DEPTH_TEST);
 
+    // ---- ImGui init ----
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 330");
+
     // ---- Load model ----
-    std::string modelPath = std::string(ASSET_DIR) + "/teapot.gltf";
+    //std::string modelPath = std::string(ASSET_DIR) + "/teapot.gltf";
+    std::string modelPath = std::string(ASSET_DIR) + "/test.obj";
     std::vector<Vertex> vertices;
     std::vector<unsigned int> indices;
     glm::vec3 bmin, bmax;
@@ -194,8 +204,6 @@ int main() {
     float maxExtent = std::max(ext.x, std::max(ext.y, ext.z));
     float scale = (maxExtent > 0.0f) ? (1.4f / maxExtent) : 1.0f;
 
-    // Base model: move to origin + uniform scale
-    // NOTE: order matters (right-multiply): M = S * T(-center)
     glm::mat4 baseModel(1.0f);
     baseModel = glm::scale(baseModel, glm::vec3(scale));
     baseModel = glm::translate(baseModel, -center);
@@ -260,17 +268,26 @@ in vec3 vNrmW;
 
 out vec4 FragColor;
 
-uniform int  uModelType;   // 0=BlinnPhong, 1=Toon, 2=OrenNayar
+// 0=BlinnPhong, 1=Toon, 2=OrenNayar, 3=CookTorrance
+uniform int  uModelType;
 
 uniform vec3  uAlbedo;
 uniform vec3  uLightPosW;
 uniform vec3  uLightColor;
 uniform vec3  uCamPosW;
+uniform float uLightIntensity;
 
 uniform float uKs;
 uniform float uShininess;
-uniform float uRoughness;   // 0..1
-uniform float uToonLevels;  // e.g. 3..6
+uniform float uRoughness;
+uniform float uToonLevels;
+
+uniform float uMetallic;
+uniform float uAO;
+uniform float uRimStrength;
+uniform float uSpecThreshold;
+
+const float PI = 3.14159265359;
 
 float saturate(float x){ return clamp(x, 0.0, 1.0); }
 
@@ -289,16 +306,30 @@ vec3 toon(vec3 N, vec3 V, vec3 L) {
     float ndotl = max(dot(N, L), 0.0);
 
     float levels = max(uToonLevels, 1.0);
-    float q = floor(ndotl * levels) / levels;      // banded diffuse
+    float x = ndotl * levels;
+    float band = floor(x) / levels;
+
+    float edge = fract(x);
+    float smoothW = 0.10;
+    float bandNext = min(1.0, (floor(x) + 1.0) / levels);
+    float t = smoothstep(0.5 - smoothW, 0.5 + smoothW, edge);
+    float q = mix(band, bandNext, t);
 
     vec3 H = normalize(L + V);
     float s = pow(max(dot(N, H), 0.0), uShininess);
-    float specBand = step(0.5, s);                 // hard spec highlight
 
-    vec3 diffuse = uAlbedo * q;
+    float specThreshold = uSpecThreshold;
+    float specSoft = 0.05;
+    float specBand = smoothstep(specThreshold - specSoft, specThreshold + specSoft, s);
+
+    float rim = pow(1.0 - max(dot(N, V), 0.0), 2.0);
+    float rimStrength = uRimStrength;
+
+    vec3 diffuse  = uAlbedo * q;
     vec3 specular = uKs * specBand * vec3(1.0);
+    vec3 rimCol   = rimStrength * rim * uAlbedo;
 
-    return (diffuse + specular) * uLightColor;
+    return (diffuse + specular + rimCol) * uLightColor;
 }
 
 // Oren–Nayar diffuse only
@@ -307,8 +338,7 @@ vec3 orenNayar(vec3 N, vec3 V, vec3 L) {
     float ndotv = max(dot(N, V), 0.0);
     if (ndotl <= 0.0 || ndotv <= 0.0) return vec3(0.0);
 
-    // Map roughness [0,1] to sigma in radians (simple course-friendly mapping)
-    float sigma = uRoughness * 1.57079632679; // ~pi/2
+    float sigma = uRoughness * 1.57079632679;
     float sigma2 = sigma * sigma;
 
     float A = 1.0 - (sigma2 / (2.0 * (sigma2 + 0.33)));
@@ -325,8 +355,57 @@ vec3 orenNayar(vec3 N, vec3 V, vec3 L) {
     float cosPhi = dot(vPerpN, lPerpN);
 
     float oren = ndotl * (A + B * max(0.0, cosPhi) * sin(alpha) * tan(beta));
-    return uAlbedo * oren * uLightColor;
+    return (uAlbedo * oren) * uLightColor;
 }
+
+// -------------------- Cook–Torrance (GGX) --------------------
+float D_GGX(float NdotH, float a) {
+    float a2 = a * a;
+    float denom = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
+    return a2 / (PI * denom * denom);
+}
+
+float G_SmithGGX(float NdotV, float NdotL, float a) {
+    // Schlick-GGX geometry term
+    float k = (a + 1.0);
+    k = (k * k) / 8.0;
+
+    float gV = NdotV / (NdotV * (1.0 - k) + k);
+    float gL = NdotL / (NdotL * (1.0 - k) + k);
+    return gV * gL;
+}
+
+vec3 F_Schlick(vec3 F0, float VdotH) {
+    return F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
+}
+
+vec3 cookTorrance(vec3 N, vec3 V, vec3 L) {
+    float NdotL = saturate(dot(N, L));
+    float NdotV = saturate(dot(N, V));
+    if (NdotL <= 0.0 || NdotV <= 0.0) return vec3(0.0);
+
+    vec3 H = normalize(V + L);
+    float NdotH = saturate(dot(N, H));
+    float VdotH = saturate(dot(V, H));
+
+    float a = max(0.03, uRoughness * uRoughness);
+
+    float D = D_GGX(NdotH, a);
+    float G = G_SmithGGX(NdotV, NdotL, a);
+
+    vec3 F0 = mix(vec3(0.04), uAlbedo, uMetallic);
+    vec3 F  = F_Schlick(F0, VdotH);
+
+    vec3 spec = (D * G * F) / max(0.001, 4.0 * NdotV * NdotL);
+
+    vec3 kd   = (vec3(1.0) - F) * (1.0 - uMetallic);
+    vec3 diff = kd * uAlbedo / PI;
+
+    vec3 brdf = diff + (uKs * spec);
+
+    return (brdf * NdotL) * uLightColor;
+}
+// ------------------------------------------------------------
 
 void main() {
     vec3 N = normalize(vNrmW);
@@ -336,10 +415,23 @@ void main() {
     vec3 c;
     if (uModelType == 0)      c = blinnPhong(N, V, L);
     else if (uModelType == 1) c = toon(N, V, L);
-    else                      c = orenNayar(N, V, L);
+    else if (uModelType == 2) c = orenNayar(N, V, L);
+    else                      c = cookTorrance(N, V, L);
 
-    vec3 ambient = 0.08 * uAlbedo * uLightColor;
-    FragColor = vec4(ambient + c, 1.0);
+    float ao = (uModelType == 3) ? uAO : 1.0;
+    vec3 ambient = 0.08 * uAlbedo * uLightColor * ao;
+    vec3 hdr = ambient + c;
+
+    // exposure / artistic boost
+    hdr *= 1.2;
+
+    // Reinhard tone mapping
+    vec3 mapped = hdr / (hdr + vec3(1.0));
+
+    // gamma encode
+    vec3 finalCol = pow(max(mapped, vec3(0.0)), vec3(1.0/2.2));
+
+    FragColor = vec4(finalCol, 1.0);
 }
 )";
 
@@ -359,7 +451,6 @@ void main() {
         return -1;
     }
 
-    // Cache uniform locations (avoid glGetUniformLocation every draw)
     const GLint loc_uModel      = glGetUniformLocation(prog, "uModel");
     const GLint loc_uView       = glGetUniformLocation(prog, "uView");
     const GLint loc_uProj       = glGetUniformLocation(prog, "uProj");
@@ -374,17 +465,80 @@ void main() {
     const GLint loc_uShininess  = glGetUniformLocation(prog, "uShininess");
     const GLint loc_uRoughness  = glGetUniformLocation(prog, "uRoughness");
     const GLint loc_uToonLevels = glGetUniformLocation(prog, "uToonLevels");
+    const GLint loc_uLightIntensity = glGetUniformLocation(prog, "uLightIntensity");
 
-    // Scene constants
+    const GLint loc_uMetallic     = glGetUniformLocation(prog, "uMetallic");
+    const GLint loc_uAO           = glGetUniformLocation(prog, "uAO");
+    const GLint loc_uRimStrength  = glGetUniformLocation(prog, "uRimStrength");
+    const GLint loc_uSpecThreshold= glGetUniformLocation(prog, "uSpecThreshold");
+
     const glm::vec3 lightColor(1.0f, 1.0f, 1.0f);
     const glm::vec3 albedo(0.75f, 0.78f, 0.85f);
 
-    // Side-by-side positions
-    const float offsets[3] = {-1.6f, 0.0f, 1.6f};
+    const float offsets[4] = {-2.4f, -0.8f, 0.8f, 2.4f};
 
-    // ---- Render loop ----
+    struct MaterialUI {
+        glm::vec3 albedo;
+        float ks;
+        float shininess;
+        float roughness;
+        float toonLevels;
+        float metallic;
+        float ao;
+        float rimStrength;
+        float specThreshold;
+    };
+
+    MaterialUI mats[4] = {
+        // 0 Blinn-Phong
+        { glm::vec3(0.75f, 0.78f, 0.85f), 0.55f, 96.0f, 0.35f, 4.0f, 0.0f, 1.0f, 0.20f, 0.50f },
+        // 1 Toon
+        { glm::vec3(0.75f, 0.78f, 0.85f), 0.25f, 48.0f, 0.35f, 4.0f, 0.0f, 1.0f, 0.20f, 0.50f },
+        // 2 Oren-Nayar
+        { glm::vec3(0.75f, 0.78f, 0.85f), 0.00f,  1.0f, 0.75f, 4.0f, 0.0f, 1.0f, 0.0f,  0.0f  },
+        // 3 Cook-Torrance
+        { glm::vec3(0.75f, 0.78f, 0.85f), 1.00f,  1.0f, 0.35f, 4.0f, 0.0f, 1.0f, 0.0f,  0.0f  }
+    };
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        ImGui::Begin("Reflectance Controls");
+
+        if (ImGui::CollapsingHeader("0) Blinn-Phong", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::ColorEdit3("Albedo##BP", glm::value_ptr(mats[0].albedo));
+            ImGui::SliderFloat("Ks##BP", &mats[0].ks, 0.0f, 2.0f);
+            ImGui::SliderFloat("Shininess##BP", &mats[0].shininess, 1.0f, 256.0f);
+        }
+
+        if (ImGui::CollapsingHeader("1) Toon", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::ColorEdit3("Albedo##Toon", glm::value_ptr(mats[1].albedo));
+            ImGui::SliderFloat("Toon Levels##Toon", &mats[1].toonLevels, 2.0f, 8.0f);
+            ImGui::SliderFloat("Ks##Toon", &mats[1].ks, 0.0f, 2.0f);
+            ImGui::SliderFloat("Shininess##Toon", &mats[1].shininess, 1.0f, 256.0f);
+            ImGui::SliderFloat("Spec Threshold##Toon", &mats[1].specThreshold, 0.0f, 1.0f);
+            ImGui::SliderFloat("Rim Strength##Toon", &mats[1].rimStrength, 0.0f, 1.0f);
+        }
+
+        if (ImGui::CollapsingHeader("2) Oren-Nayar", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::ColorEdit3("Albedo##ON", glm::value_ptr(mats[2].albedo));
+            ImGui::SliderFloat("Roughness##ON", &mats[2].roughness, 0.0f, 1.0f);
+        }
+
+        if (ImGui::CollapsingHeader("3) Cook-Torrance", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::ColorEdit3("Albedo##CT", glm::value_ptr(mats[3].albedo));
+            ImGui::SliderFloat("Metallic##CT", &mats[3].metallic, 0.0f, 1.0f);
+            ImGui::SliderFloat("Roughness##CT", &mats[3].roughness, 0.02f, 1.0f);
+            ImGui::SliderFloat("AO##CT", &mats[3].ao, 0.0f, 1.0f);
+            ImGui::SliderFloat("Spec Scale (Ks)##CT", &mats[3].ks, 0.0f, 2.0f);
+        }
+
+        ImGui::End();
+
+
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
             glfwSetWindowShouldClose(window, 1);
 
@@ -396,13 +550,11 @@ void main() {
         glClearColor(0.08f, 0.09f, 0.11f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        // Camera (fixed, looking at center teapot)
-        glm::vec3 camPos(0.0f, 1.1f, 4.0f);
+        glm::vec3 camPos(0.0f, 1.1f, 4.2f);
         glm::mat4 P = glm::perspective(glm::radians(60.0f), (float)w / (float)h, 0.1f, 100.0f);
         glm::mat4 V = glm::lookAt(camPos, glm::vec3(0.0f, 0.3f, 0.0f), glm::vec3(0, 1, 0));
 
-        // Light position (world)
-        glm::vec3 lightPos(2.5f, 3.0f, 2.0f);
+        glm::vec3 lightPos(100.0f, 25.0f, 16.0f);
 
         glUseProgram(prog);
         glUniformMatrix4fv(loc_uView, 1, GL_FALSE, glm::value_ptr(V));
@@ -412,45 +564,42 @@ void main() {
         glUniform3fv(loc_uLightColor, 1, glm::value_ptr(lightColor));
         glUniform3fv(loc_uCamPosW, 1, glm::value_ptr(camPos));
 
-        glUniform3fv(loc_uAlbedo, 1, glm::value_ptr(albedo));
+        glUniform1f(loc_uLightIntensity, 8.0f);
 
         glBindVertexArray(vao);
 
         float t = (float)glfwGetTime();
+        const float omega = 0.8f;
 
-        for (int i = 0; i < 3; ++i) {
-            int modelType = i; // 0=Blinn-Phong, 1=Toon, 2=Oren-Nayar
+        for (int i = 0; i < 4; ++i) {
+            int modelType = i; // 0=Blinn,1=Toon,2=Oren,3=Cook
             glUniform1i(loc_uModelType, modelType);
 
             glm::mat4 T = glm::translate(glm::mat4(1.0f), glm::vec3(offsets[i], 0.0f, 0.0f));
-            const float omega = 0.8f; // radians/sec (tweak if you want faster/slower)
             glm::mat4 R = glm::rotate(glm::mat4(1.0f), t * omega, glm::vec3(0, 1, 0));
             glm::mat4 M = T * R * baseModel;
 
             glUniformMatrix4fv(loc_uModel, 1, GL_FALSE, glm::value_ptr(M));
 
-            // Model-specific parameters (tweak as you like)
-            if (modelType == 0) {            // Blinn-Phong
-                glUniform1f(loc_uKs, 0.55f);
-                glUniform1f(loc_uShininess, 96.0f);
-                glUniform1f(loc_uToonLevels, 4.0f); // unused
-                glUniform1f(loc_uRoughness, 0.5f);  // unused
-            } else if (modelType == 1) {     // Toon (NPR)
-                glUniform1f(loc_uKs, 0.25f);
-                glUniform1f(loc_uShininess, 48.0f);
-                glUniform1f(loc_uToonLevels, 4.0f);
-                glUniform1f(loc_uRoughness, 0.5f);  // unused
-            } else {                          // Oren-Nayar (rough diffuse)
-                glUniform1f(loc_uKs, 0.0f);          // diffuse-only here
-                glUniform1f(loc_uShininess, 1.0f);   // unused
-                glUniform1f(loc_uToonLevels, 4.0f);  // unused
-                glUniform1f(loc_uRoughness, 0.75f);  // 0..1 (higher = rougher)
-            }
+            MaterialUI& m = mats[i];
+
+            glUniform3fv(loc_uAlbedo, 1, glm::value_ptr(m.albedo));
+            glUniform1f(loc_uKs, m.ks);
+            glUniform1f(loc_uShininess, m.shininess);
+            glUniform1f(loc_uRoughness, m.roughness);
+            glUniform1f(loc_uToonLevels, m.toonLevels);
+
+            glUniform1f(loc_uMetallic, m.metallic);
+            glUniform1f(loc_uAO, m.ao);
+            glUniform1f(loc_uRimStrength, m.rimStrength);
+            glUniform1f(loc_uSpecThreshold, m.specThreshold);
 
             glDrawElements(GL_TRIANGLES, (GLsizei)indices.size(), GL_UNSIGNED_INT, 0);
         }
 
         glBindVertexArray(0);
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
     }
 
@@ -459,6 +608,10 @@ void main() {
     glDeleteBuffers(1, &ebo);
     glDeleteBuffers(1, &vbo);
     glDeleteVertexArrays(1, &vao);
+
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
 
     glfwDestroyWindow(window);
     glfwTerminate();

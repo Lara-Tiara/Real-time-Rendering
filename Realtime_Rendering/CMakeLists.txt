@@ -45,6 +45,32 @@ add_executable(app
         external/glad/src/glad.c
 )
 
+# ---- Dear ImGui ----
+set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/external/imgui)
+
+target_sources(app PRIVATE
+        ${IMGUI_DIR}/imgui.cpp
+        ${IMGUI_DIR}/imgui_draw.cpp
+        ${IMGUI_DIR}/imgui_tables.cpp
+        ${IMGUI_DIR}/imgui_widgets.cpp
+        # ${IMGUI_DIR}/imgui_demo.cpp   # optional
+
+        ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp
+        ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+)
+
+target_include_directories(app PRIVATE
+        ${IMGUI_DIR}
+        ${IMGUI_DIR}/backends
+)
+
+# Tell ImGui's OpenGL backend to use GLAD as the loader
+target_compile_definitions(app PRIVATE IMGUI_IMPL_OPENGL_LOADER_GLAD)
+
+# (Optional on macOS: silence OpenGL deprecation warnings)
+target_compile_definitions(app PRIVATE GL_SILENCE_DEPRECATION)
+
+
 target_include_directories(app PRIVATE
         external/glad/include
 )
