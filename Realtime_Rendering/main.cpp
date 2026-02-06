@@ -1,5 +1,3 @@
-// 0 = Blinn-Phong, 1 = Toon, 2 = Oren-Nayar, 3 = Cook-Torrance
-
 #include <iostream>
 #include <vector>
 #include <stdexcept>
@@ -7,6 +5,7 @@
 #include <cfloat>
 #include <cmath>
 #include <algorithm>
+#include <array>
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -14,7 +13,6 @@
 #include "imgui.h"
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_opengl3.h"
-
 
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
@@ -24,9 +22,19 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
+#include <stb_image.h>
+
 struct Vertex {
     float px, py, pz;
     float nx, ny, nz;
+};
+
+struct GPUMesh {
+    GLuint vao = 0;
+    GLuint vbo = 0;
+    GLuint ebo = 0;
+    GLsizei indexCount = 0;
+    glm::mat4 baseModel = glm::mat4(1.0f);
 };
 
 static void framebuffer_size_callback(GLFWwindow*, int w, int h) {
@@ -116,7 +124,6 @@ static void loadMergedMeshesAssimp(
     for (unsigned m = 0; m < scene->mNumMeshes; ++m) {
         const aiMesh* mesh = scene->mMeshes[m];
 
-        // vertices
         for (unsigned i = 0; i < mesh->mNumVertices; ++i) {
             glm::vec3 p = aiToGlm(mesh->mVertices[i]);
             glm::vec3 n = mesh->HasNormals() ? glm::normalize(aiToGlm(mesh->mNormals[i]))
@@ -128,7 +135,6 @@ static void loadMergedMeshesAssimp(
             outVertices.push_back(Vertex{p.x, p.y, p.z, n.x, n.y, n.z});
         }
 
-        // indices
         for (unsigned f = 0; f < mesh->mNumFaces; ++f) {
             const aiFace& face = mesh->mFaces[f];
             for (unsigned j = 0; j < face.mNumIndices; ++j) {
@@ -140,8 +146,115 @@ static void loadMergedMeshesAssimp(
     }
 }
 
+static glm::mat4 computeNormalizationModel(const glm::vec3& bmin, const glm::vec3& bmax, float targetSize = 1.4f) {
+    glm::vec3 center = 0.5f * (bmin + bmax);
+    glm::vec3 ext = (bmax - bmin);
+    float maxExtent = std::max(ext.x, std::max(ext.y, ext.z));
+    float scale = (maxExtent > 0.0f) ? (targetSize / maxExtent) : 1.0f;
+
+    glm::mat4 M(1.0f);
+    M = glm::scale(M, glm::vec3(scale));
+    M = glm::translate(M, -center);
+    return M;
+}
+
+static GPUMesh uploadMeshToGPU(const std::vector<Vertex>& vertices, const std::vector<unsigned int>& indices, const glm::mat4& baseModel) {
+    GPUMesh mesh;
+    mesh.baseModel = baseModel;
+    mesh.indexCount = (GLsizei)indices.size();
+
+    glGenVertexArrays(1, &mesh.vao);
+    glGenBuffers(1, &mesh.vbo);
+    glGenBuffers(1, &mesh.ebo);
+
+    glBindVertexArray(mesh.vao);
+
+    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 (GLsizeiptr)(vertices.size() * sizeof(Vertex)),
+                 vertices.data(),
+                 GL_STATIC_DRAW);
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                 (GLsizeiptr)(indices.size() * sizeof(unsigned int)),
+                 indices.data(),
+                 GL_STATIC_DRAW);
+
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, px));
+
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, nx));
+
+    glBindVertexArray(0);
+    return mesh;
+}
+
+static void destroyMesh(GPUMesh& m) {
+    if (m.ebo) glDeleteBuffers(1, &m.ebo);
+    if (m.vbo) glDeleteBuffers(1, &m.vbo);
+    if (m.vao) glDeleteVertexArrays(1, &m.vao);
+    m = GPUMesh{};
+}
+
+static GLuint loadCubemap(const std::array<std::string, 6>& faces)
+{
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, tex);
+
+    stbi_set_flip_vertically_on_load(false);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+    int baseW = -1, baseH = -1;
+
+    for (GLuint i = 0; i < 6; ++i)
+    {
+        int w, h, n;
+        unsigned char* data = stbi_load(faces[i].c_str(), &w, &h, &n, 3); // force RGB
+
+        if (!data) {
+            std::cerr << "[Cubemap] FAIL face " << i << " : " << faces[i] << "\n"
+                      << "  reason: " << (stbi_failure_reason() ? stbi_failure_reason() : "(unknown)") << "\n";
+            throw std::runtime_error("Cubemap face failed to load.");
+        }
+
+        std::cerr << "[Cubemap] OK   face " << i << " : " << faces[i]
+                  << " (" << w << "x" << h << ", srcChannels=" << n << ", forced=3)\n";
+
+        if (i == 0) { baseW = w; baseH = h; }
+        if (w != baseW || h != baseH) {
+            stbi_image_free(data);
+            throw std::runtime_error("Cubemap faces must all be the same resolution.");
+        }
+
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i,
+                     0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
+
+        stbi_image_free(data);
+
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) {
+            std::cerr << "[Cubemap] glTexImage2D error face " << i << " : 0x"
+                      << std::hex << err << std::dec << "\n";
+            throw std::runtime_error("OpenGL error uploading cubemap face.");
+        }
+    }
+
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+    return tex;
+}
+
 int main() {
-    // ---- GLFW init ----
     if (!glfwInit()) {
         std::cerr << "Failed to init GLFW\n";
         return -1;
@@ -152,7 +265,7 @@ int main() {
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 
-    GLFWwindow* window = glfwCreateWindow(1400, 720, "4 Teapots: Blinn-Phong / Toon / Oren-Nayar / Cook-Torrance", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1400, 720, "Lab 2 - Transmittance (Fresnel + Dispersion + Cubemap)", nullptr, nullptr);
     if (!window) {
         std::cerr << "Failed to create GLFW window\n";
         glfwTerminate();
@@ -170,75 +283,102 @@ int main() {
     }
 
     glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
 
-    // ---- ImGui init ----
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
-
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
 
-    // ---- Load model ----
-    //std::string modelPath = std::string(ASSET_DIR) + "/teapot.gltf";
-    std::string modelPath = std::string(ASSET_DIR) + "/test.obj";
-    std::vector<Vertex> vertices;
-    std::vector<unsigned int> indices;
-    glm::vec3 bmin, bmax;
+    const std::string testPath = std::string(ASSET_DIR) + "/test.obj";
+    const std::string capPath  = std::string(ASSET_DIR) + "/cap.obj";
+    const std::string moonPath = std::string(ASSET_DIR) + "/Moon.obj";
 
+    auto loadOne = [&](const std::string& path, GPUMesh& outMesh) {
+        std::vector<Vertex> v;
+        std::vector<unsigned int> idx;
+        glm::vec3 bmin, bmax;
+        loadMergedMeshesAssimp(path, v, idx, bmin, bmax);
+        std::cout << "Loaded " << path << " | vertices=" << v.size() << " | indices=" << idx.size() << "\n";
+        glm::mat4 base = computeNormalizationModel(bmin, bmax, 1.4f);
+        outMesh = uploadMeshToGPU(v, idx, base);
+    };
+
+    GPUMesh testMesh, capMesh, moonMesh, staMesh;
     try {
-        loadMergedMeshesAssimp(modelPath, vertices, indices, bmin, bmax);
-        std::cout << "Loaded " << modelPath
-                  << " | vertices=" << vertices.size()
-                  << " | indices=" << indices.size() << "\n";
+        loadOne(testPath, testMesh);
+        loadOne(capPath,  capMesh);
+        loadOne(moonPath, moonMesh);
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\n";
+        destroyMesh(testMesh);
+        destroyMesh(capMesh);
+        destroyMesh(moonMesh);
         glfwDestroyWindow(window);
         glfwTerminate();
         return -1;
     }
 
-    // ---- Normalize model (center + scale) ----
-    glm::vec3 center = 0.5f * (bmin + bmax);
-    glm::vec3 ext = (bmax - bmin);
-    float maxExtent = std::max(ext.x, std::max(ext.y, ext.z));
-    float scale = (maxExtent > 0.0f) ? (1.4f / maxExtent) : 1.0f;
+    // ---- Skybox geometry (cube) ----
+    float skyboxVerts[] = {
+        // back
+        -1.f,  1.f, -1.f,  -1.f, -1.f, -1.f,   1.f, -1.f, -1.f,
+         1.f, -1.f, -1.f,   1.f,  1.f, -1.f,  -1.f,  1.f, -1.f,
+        // left
+        -1.f, -1.f,  1.f,  -1.f, -1.f, -1.f,  -1.f,  1.f, -1.f,
+        -1.f,  1.f, -1.f,  -1.f,  1.f,  1.f,  -1.f, -1.f,  1.f,
+        // right
+         1.f, -1.f, -1.f,   1.f, -1.f,  1.f,   1.f,  1.f,  1.f,
+         1.f,  1.f,  1.f,   1.f,  1.f, -1.f,   1.f, -1.f, -1.f,
+        // front
+        -1.f, -1.f,  1.f,  -1.f,  1.f,  1.f,   1.f,  1.f,  1.f,
+         1.f,  1.f,  1.f,   1.f, -1.f,  1.f,  -1.f, -1.f,  1.f,
+        // top
+        -1.f,  1.f, -1.f,   1.f,  1.f, -1.f,   1.f,  1.f,  1.f,
+         1.f,  1.f,  1.f,  -1.f,  1.f,  1.f,  -1.f,  1.f, -1.f,
+        // bottom
+        -1.f, -1.f, -1.f,  -1.f, -1.f,  1.f,   1.f, -1.f,  1.f,
+         1.f, -1.f,  1.f,   1.f, -1.f, -1.f,  -1.f, -1.f, -1.f
+    };
 
-    glm::mat4 baseModel(1.0f);
-    baseModel = glm::scale(baseModel, glm::vec3(scale));
-    baseModel = glm::translate(baseModel, -center);
-
-    // ---- Upload to GPU ----
-    GLuint vao = 0, vbo = 0, ebo = 0;
-    glGenVertexArrays(1, &vao);
-    glGenBuffers(1, &vbo);
-    glGenBuffers(1, &ebo);
-
-    glBindVertexArray(vao);
-
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER,
-                 (GLsizeiptr)(vertices.size() * sizeof(Vertex)),
-                 vertices.data(),
-                 GL_STATIC_DRAW);
-
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                 (GLsizeiptr)(indices.size() * sizeof(unsigned int)),
-                 indices.data(),
-                 GL_STATIC_DRAW);
-
-    // layout(location=0): position
+    GLuint skyVAO = 0, skyVBO = 0;
+    glGenVertexArrays(1, &skyVAO);
+    glGenBuffers(1, &skyVBO);
+    glBindVertexArray(skyVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, skyVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(skyboxVerts), skyboxVerts, GL_STATIC_DRAW);
     glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, px));
-    // layout(location=1): normal
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, nx));
-
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
     glBindVertexArray(0);
 
+    // ---- Load cubemap ----
+    const std::string skyDir = std::string(ASSET_DIR) + "/skybox";
+    std::array<std::string, 6> faces = {
+        skyDir + "/right.jpg",
+        skyDir + "/left.jpg",
+        skyDir + "/top.jpg",
+        skyDir + "/bottom.jpg",
+        skyDir + "/front.jpg",
+        skyDir + "/back.jpg"
+    };
+
+    GLuint cubemapTex = 0;
+    try {
+        cubemapTex = loadCubemap(faces);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\n";
+        destroyMesh(testMesh);
+        destroyMesh(capMesh);
+        destroyMesh(moonMesh);
+        destroyMesh(staMesh);
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
+    }
+
     // ---- Shaders ----
-    const char* vsSrc = R"(
+    const char* glassVS = R"(
 #version 330 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNrm;
@@ -261,286 +401,213 @@ void main() {
 }
 )";
 
-    const char* fsSrc = R"(
+    // UPDATED glassFS
+    const char* glassFS = R"(
 #version 330 core
 in vec3 vPosW;
 in vec3 vNrmW;
 
 out vec4 FragColor;
 
-// 0=BlinnPhong, 1=Toon, 2=OrenNayar, 3=CookTorrance
-uniform int  uModelType;
-
-uniform vec3  uAlbedo;
-uniform vec3  uLightPosW;
-uniform vec3  uLightColor;
+uniform samplerCube uEnvMap;
 uniform vec3  uCamPosW;
-uniform float uLightIntensity;
 
-uniform float uKs;
-uniform float uShininess;
-uniform float uRoughness;
-uniform float uToonLevels;
+uniform float uIOR;              // e.g. glass ~1.5, diamond ~2.42
+uniform float uDispersion;       // relative, try 0..0.2 (stylized)
+uniform vec3  uTint;
 
-uniform float uMetallic;
-uniform float uAO;
-uniform float uRimStrength;
-uniform float uSpecThreshold;
-
-const float PI = 3.14159265359;
+uniform float uRefractStrength;  // 0..1 (blend I -> refracted dir)
+uniform float uFresnelStrength;  // 0..1.5 (reduces/boosts reflection dominance)
 
 float saturate(float x){ return clamp(x, 0.0, 1.0); }
 
-vec3 blinnPhong(vec3 N, vec3 V, vec3 L) {
-    float ndotl = max(dot(N, L), 0.0);
-    vec3 diffuse = uAlbedo * ndotl;
-
-    vec3 H = normalize(L + V);
-    float spec = pow(max(dot(N, H), 0.0), uShininess);
-    vec3 specular = uKs * spec * vec3(1.0);
-
-    return (diffuse + specular) * uLightColor;
+vec3 srgbToLinear(vec3 c) {
+    return pow(max(c, vec3(0.0)), vec3(2.2));
 }
 
-vec3 toon(vec3 N, vec3 V, vec3 L) {
-    float ndotl = max(dot(N, L), 0.0);
-
-    float levels = max(uToonLevels, 1.0);
-    float x = ndotl * levels;
-    float band = floor(x) / levels;
-
-    float edge = fract(x);
-    float smoothW = 0.10;
-    float bandNext = min(1.0, (floor(x) + 1.0) / levels);
-    float t = smoothstep(0.5 - smoothW, 0.5 + smoothW, edge);
-    float q = mix(band, bandNext, t);
-
-    vec3 H = normalize(L + V);
-    float s = pow(max(dot(N, H), 0.0), uShininess);
-
-    float specThreshold = uSpecThreshold;
-    float specSoft = 0.05;
-    float specBand = smoothstep(specThreshold - specSoft, specThreshold + specSoft, s);
-
-    float rim = pow(1.0 - max(dot(N, V), 0.0), 2.0);
-    float rimStrength = uRimStrength;
-
-    vec3 diffuse  = uAlbedo * q;
-    vec3 specular = uKs * specBand * vec3(1.0);
-    vec3 rimCol   = rimStrength * rim * uAlbedo;
-
-    return (diffuse + specular + rimCol) * uLightColor;
+vec3 sampleEnvLinear(vec3 dir) {
+    vec3 c = texture(uEnvMap, dir).rgb;  // LDR cubemap assumed sRGB-ish
+    return srgbToLinear(c);              // convert to linear for mixing/lighting
 }
-
-// Oren–Nayar diffuse only
-vec3 orenNayar(vec3 N, vec3 V, vec3 L) {
-    float ndotl = max(dot(N, L), 0.0);
-    float ndotv = max(dot(N, V), 0.0);
-    if (ndotl <= 0.0 || ndotv <= 0.0) return vec3(0.0);
-
-    float sigma = uRoughness * 1.57079632679;
-    float sigma2 = sigma * sigma;
-
-    float A = 1.0 - (sigma2 / (2.0 * (sigma2 + 0.33)));
-    float B = 0.45 * sigma2 / (sigma2 + 0.09);
-
-    float theta_i = acos(clamp(ndotl, 0.0, 1.0));
-    float theta_r = acos(clamp(ndotv, 0.0, 1.0));
-
-    float alpha = max(theta_i, theta_r);
-    float beta  = min(theta_i, theta_r);
-
-    vec3 vPerpN = normalize(V - N * ndotv);
-    vec3 lPerpN = normalize(L - N * ndotl);
-    float cosPhi = dot(vPerpN, lPerpN);
-
-    float oren = ndotl * (A + B * max(0.0, cosPhi) * sin(alpha) * tan(beta));
-    return (uAlbedo * oren) * uLightColor;
-}
-
-// -------------------- Cook–Torrance (GGX) --------------------
-float D_GGX(float NdotH, float a) {
-    float a2 = a * a;
-    float denom = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
-    return a2 / (PI * denom * denom);
-}
-
-float G_SmithGGX(float NdotV, float NdotL, float a) {
-    // Schlick-GGX geometry term
-    float k = (a + 1.0);
-    k = (k * k) / 8.0;
-
-    float gV = NdotV / (NdotV * (1.0 - k) + k);
-    float gL = NdotL / (NdotL * (1.0 - k) + k);
-    return gV * gL;
-}
-
-vec3 F_Schlick(vec3 F0, float VdotH) {
-    return F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
-}
-
-vec3 cookTorrance(vec3 N, vec3 V, vec3 L) {
-    float NdotL = saturate(dot(N, L));
-    float NdotV = saturate(dot(N, V));
-    if (NdotL <= 0.0 || NdotV <= 0.0) return vec3(0.0);
-
-    vec3 H = normalize(V + L);
-    float NdotH = saturate(dot(N, H));
-    float VdotH = saturate(dot(V, H));
-
-    float a = max(0.03, uRoughness * uRoughness);
-
-    float D = D_GGX(NdotH, a);
-    float G = G_SmithGGX(NdotV, NdotL, a);
-
-    vec3 F0 = mix(vec3(0.04), uAlbedo, uMetallic);
-    vec3 F  = F_Schlick(F0, VdotH);
-
-    vec3 spec = (D * G * F) / max(0.001, 4.0 * NdotV * NdotL);
-
-    vec3 kd   = (vec3(1.0) - F) * (1.0 - uMetallic);
-    vec3 diff = kd * uAlbedo / PI;
-
-    vec3 brdf = diff + (uKs * spec);
-
-    return (brdf * NdotL) * uLightColor;
-}
-// ------------------------------------------------------------
 
 void main() {
     vec3 N = normalize(vNrmW);
-    vec3 V = normalize(uCamPosW - vPosW);
-    vec3 L = normalize(uLightPosW - vPosW);
+    vec3 V = normalize(uCamPosW - vPosW);   // frag -> camera
+    if (dot(N, V) < 0.0) N = -N;            // IMPORTANT: keep normal facing viewer
 
-    vec3 c;
-    if (uModelType == 0)      c = blinnPhong(N, V, L);
-    else if (uModelType == 1) c = toon(N, V, L);
-    else if (uModelType == 2) c = orenNayar(N, V, L);
-    else                      c = cookTorrance(N, V, L);
+    vec3 I = -V;                            // camera -> frag
 
-    float ao = (uModelType == 3) ? uAO : 1.0;
-    vec3 ambient = 0.08 * uAlbedo * uLightColor * ao;
-    vec3 hdr = ambient + c;
+    // Reflection (linear)
+    vec3 R = reflect(I, N);
+    vec3 refl = sampleEnvLinear(R);
 
-    // exposure / artistic boost
-    hdr *= 1.2;
+    // Dispersion on eta (relative), not by adding/subtracting to IOR directly
+    float eta  = 1.0 / uIOR;
+    float etaR = eta * (1.0 - uDispersion);
+    float etaG = eta;
+    float etaB = eta * (1.0 + uDispersion);
 
-    // Reinhard tone mapping
-    vec3 mapped = hdr / (hdr + vec3(1.0));
+    vec3 TrFull = refract(I, N, etaR);
+    vec3 TgFull = refract(I, N, etaG);
+    vec3 TbFull = refract(I, N, etaB);
 
-    // gamma encode
-    vec3 finalCol = pow(max(mapped, vec3(0.0)), vec3(1.0/2.2));
+    // Handle total internal reflection: refract returns (0,0,0)
+    if (dot(TrFull, TrFull) < 1e-6) TrFull = R;
+    if (dot(TgFull, TgFull) < 1e-6) TgFull = R;
+    if (dot(TbFull, TbFull) < 1e-6) TbFull = R;
 
-    FragColor = vec4(finalCol, 1.0);
+    // Artistic control: blend between no-bend (I) and full refract
+    vec3 Tr = normalize(mix(I, TrFull, uRefractStrength));
+    vec3 Tg = normalize(mix(I, TgFull, uRefractStrength));
+    vec3 Tb = normalize(mix(I, TbFull, uRefractStrength));
+
+    // Refraction sampling (linear), but take R/G/B from different directions
+    vec3 refr;
+    refr.r = sampleEnvLinear(Tr).r;
+    refr.g = sampleEnvLinear(Tg).g;
+    refr.b = sampleEnvLinear(Tb).b;
+
+    refr *= uTint; // treat tint as linear multiplier
+
+    // Fresnel (Schlick)
+    float f0 = (uIOR - 1.0) / (uIOR + 1.0);
+    f0 = f0 * f0;
+
+    float cosTheta = saturate(dot(N, V));
+    float F = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
+
+    // Control how much reflection hides refraction/dispersion
+    F = clamp(F * uFresnelStrength, 0.0, 1.0);
+
+    // Mix in linear
+    vec3 col = mix(refr, refl, F);
+
+    // Simple tonemap + gamma for display
+    col = col / (col + vec3(1.0));
+    col = pow(max(col, vec3(0.0)), vec3(1.0/2.2));
+
+    FragColor = vec4(col, 1.0);
 }
 )";
 
-    GLuint vs = 0, fs = 0, prog = 0;
+    const char* skyVS = R"(
+#version 330 core
+layout(location=0) in vec3 aPos;
+
+out vec3 vDir;
+
+uniform mat4 uView;
+uniform mat4 uProj;
+
+void main() {
+    vDir = aPos;
+    vec4 p = uProj * uView * vec4(aPos, 1.0);
+    gl_Position = p.xyww;
+}
+)";
+
+    const char* skyFS = R"(
+#version 330 core
+in vec3 vDir;
+out vec4 FragColor;
+
+uniform samplerCube uEnvMap;
+
+void main() {
+    // keep as-is (your skybox is LDR JPG; this displays fine for the lab)
+    vec3 c = texture(uEnvMap, vDir).rgb;
+    c = pow(max(c, vec3(0.0)), vec3(1.0/2.2));
+    FragColor = vec4(c, 1.0);
+}
+)";
+
+    GLuint glassProg = 0, skyProg = 0;
     try {
-        vs = compileShader(GL_VERTEX_SHADER, vsSrc);
-        fs = compileShader(GL_FRAGMENT_SHADER, fsSrc);
-        prog = linkProgram(vs, fs);
+        GLuint vs = compileShader(GL_VERTEX_SHADER, glassVS);
+        GLuint fs = compileShader(GL_FRAGMENT_SHADER, glassFS);
+        glassProg = linkProgram(vs, fs);
         glDeleteShader(vs);
         glDeleteShader(fs);
+
+        GLuint svs = compileShader(GL_VERTEX_SHADER, skyVS);
+        GLuint sfs = compileShader(GL_FRAGMENT_SHADER, skyFS);
+        skyProg = linkProgram(svs, sfs);
+        glDeleteShader(svs);
+        glDeleteShader(sfs);
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\n";
-        if (vs) glDeleteShader(vs);
-        if (fs) glDeleteShader(fs);
+        glDeleteTextures(1, &cubemapTex);
+        destroyMesh(testMesh);
+        destroyMesh(capMesh);
+        destroyMesh(moonMesh);
         glfwDestroyWindow(window);
         glfwTerminate();
         return -1;
     }
 
-    const GLint loc_uModel      = glGetUniformLocation(prog, "uModel");
-    const GLint loc_uView       = glGetUniformLocation(prog, "uView");
-    const GLint loc_uProj       = glGetUniformLocation(prog, "uProj");
-    const GLint loc_uModelType  = glGetUniformLocation(prog, "uModelType");
+    const GLint g_uModel    = glGetUniformLocation(glassProg, "uModel");
+    const GLint g_uView     = glGetUniformLocation(glassProg, "uView");
+    const GLint g_uProj     = glGetUniformLocation(glassProg, "uProj");
+    const GLint g_uEnvMap   = glGetUniformLocation(glassProg, "uEnvMap");
+    const GLint g_uCamPosW  = glGetUniformLocation(glassProg, "uCamPosW");
+    const GLint g_uIOR      = glGetUniformLocation(glassProg, "uIOR");
+    const GLint g_uDisp     = glGetUniformLocation(glassProg, "uDispersion");
+    const GLint g_uTint     = glGetUniformLocation(glassProg, "uTint");
 
-    const GLint loc_uAlbedo     = glGetUniformLocation(prog, "uAlbedo");
-    const GLint loc_uLightPosW  = glGetUniformLocation(prog, "uLightPosW");
-    const GLint loc_uLightColor = glGetUniformLocation(prog, "uLightColor");
-    const GLint loc_uCamPosW    = glGetUniformLocation(prog, "uCamPosW");
+    const GLint g_uRefractStrength = glGetUniformLocation(glassProg, "uRefractStrength");
+    const GLint g_uFresnelStrength = glGetUniformLocation(glassProg, "uFresnelStrength");
 
-    const GLint loc_uKs         = glGetUniformLocation(prog, "uKs");
-    const GLint loc_uShininess  = glGetUniformLocation(prog, "uShininess");
-    const GLint loc_uRoughness  = glGetUniformLocation(prog, "uRoughness");
-    const GLint loc_uToonLevels = glGetUniformLocation(prog, "uToonLevels");
-    const GLint loc_uLightIntensity = glGetUniformLocation(prog, "uLightIntensity");
+    const GLint s_uView     = glGetUniformLocation(skyProg, "uView");
+    const GLint s_uProj     = glGetUniformLocation(skyProg, "uProj");
+    const GLint s_uEnvMap   = glGetUniformLocation(skyProg, "uEnvMap");
 
-    const GLint loc_uMetallic     = glGetUniformLocation(prog, "uMetallic");
-    const GLint loc_uAO           = glGetUniformLocation(prog, "uAO");
-    const GLint loc_uRimStrength  = glGetUniformLocation(prog, "uRimStrength");
-    const GLint loc_uSpecThreshold= glGetUniformLocation(prog, "uSpecThreshold");
+    glUseProgram(glassProg);
+    glUniform1i(g_uEnvMap, 0);
 
-    const glm::vec3 lightColor(1.0f, 1.0f, 1.0f);
-    const glm::vec3 albedo(0.75f, 0.78f, 0.85f);
+    glUseProgram(skyProg);
+    glUniform1i(s_uEnvMap, 0);
 
-    const float offsets[4] = {-2.4f, -0.8f, 0.8f, 2.4f};
+    // ---- UI parameters ----
+    float ior = 1.50f;
 
-    struct MaterialUI {
-        glm::vec3 albedo;
-        float ks;
-        float shininess;
-        float roughness;
-        float toonLevels;
-        float metallic;
-        float ao;
-        float rimStrength;
-        float specThreshold;
-    };
+    float dispersion = 0.05f;
 
-    MaterialUI mats[4] = {
-        // 0 Blinn-Phong
-        { glm::vec3(0.75f, 0.78f, 0.85f), 0.55f, 96.0f, 0.35f, 4.0f, 0.0f, 1.0f, 0.20f, 0.50f },
-        // 1 Toon
-        { glm::vec3(0.75f, 0.78f, 0.85f), 0.25f, 48.0f, 0.35f, 4.0f, 0.0f, 1.0f, 0.20f, 0.50f },
-        // 2 Oren-Nayar
-        { glm::vec3(0.75f, 0.78f, 0.85f), 0.00f,  1.0f, 0.75f, 4.0f, 0.0f, 1.0f, 0.0f,  0.0f  },
-        // 3 Cook-Torrance
-        { glm::vec3(0.75f, 0.78f, 0.85f), 1.00f,  1.0f, 0.35f, 4.0f, 0.0f, 1.0f, 0.0f,  0.0f  }
-    };
+    glm::vec3 tint(1.0f, 1.0f, 1.0f);
+
+    float refrStrength = 0.65f;
+    float fresnelStrength = 1.0f;
+
+    float camYawDeg = 0.0f;
+    float camPitchDeg = 10.0f;
+    float camDist = 6.0f;
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+
+        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+            glfwSetWindowShouldClose(window, 1);
+
+        // ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::Begin("Reflectance Controls");
+        ImGui::Begin("Lab 2 Controls");
+        ImGui::SliderFloat("IOR", &ior, 1.0f, 2.4f);
 
-        if (ImGui::CollapsingHeader("0) Blinn-Phong", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::ColorEdit3("Albedo##BP", glm::value_ptr(mats[0].albedo));
-            ImGui::SliderFloat("Ks##BP", &mats[0].ks, 0.0f, 2.0f);
-            ImGui::SliderFloat("Shininess##BP", &mats[0].shininess, 1.0f, 256.0f);
-        }
+        ImGui::SliderFloat("Dispersion", &dispersion, 0.0f, 0.20f);
 
-        if (ImGui::CollapsingHeader("1) Toon", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::ColorEdit3("Albedo##Toon", glm::value_ptr(mats[1].albedo));
-            ImGui::SliderFloat("Toon Levels##Toon", &mats[1].toonLevels, 2.0f, 8.0f);
-            ImGui::SliderFloat("Ks##Toon", &mats[1].ks, 0.0f, 2.0f);
-            ImGui::SliderFloat("Shininess##Toon", &mats[1].shininess, 1.0f, 256.0f);
-            ImGui::SliderFloat("Spec Threshold##Toon", &mats[1].specThreshold, 0.0f, 1.0f);
-            ImGui::SliderFloat("Rim Strength##Toon", &mats[1].rimStrength, 0.0f, 1.0f);
-        }
+        ImGui::ColorEdit3("Tint", glm::value_ptr(tint));
 
-        if (ImGui::CollapsingHeader("2) Oren-Nayar", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::ColorEdit3("Albedo##ON", glm::value_ptr(mats[2].albedo));
-            ImGui::SliderFloat("Roughness##ON", &mats[2].roughness, 0.0f, 1.0f);
-        }
+        ImGui::SliderFloat("Refract Strength", &refrStrength, 0.0f, 1.0f);
+        ImGui::SliderFloat("Fresnel Strength", &fresnelStrength, 0.0f, 1.5f);
 
-        if (ImGui::CollapsingHeader("3) Cook-Torrance", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::ColorEdit3("Albedo##CT", glm::value_ptr(mats[3].albedo));
-            ImGui::SliderFloat("Metallic##CT", &mats[3].metallic, 0.0f, 1.0f);
-            ImGui::SliderFloat("Roughness##CT", &mats[3].roughness, 0.02f, 1.0f);
-            ImGui::SliderFloat("AO##CT", &mats[3].ao, 0.0f, 1.0f);
-            ImGui::SliderFloat("Spec Scale (Ks)##CT", &mats[3].ks, 0.0f, 2.0f);
-        }
+        ImGui::Separator();
+        ImGui::SliderFloat("Cam Yaw (deg)", &camYawDeg, -180.0f, 180.0f);
+        ImGui::SliderFloat("Cam Pitch (deg)", &camPitchDeg, -60.0f, 60.0f);
+        ImGui::SliderFloat("Cam Distance", &camDist, 2.0f, 20.0f);
 
         ImGui::End();
-
-
-        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
-            glfwSetWindowShouldClose(window, 1);
 
         int w = 0, h = 0;
         glfwGetFramebufferSize(window, &w, &h);
@@ -550,64 +617,108 @@ void main() {
         glClearColor(0.08f, 0.09f, 0.11f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        glm::vec3 camPos(0.0f, 1.1f, 4.2f);
-        glm::mat4 P = glm::perspective(glm::radians(60.0f), (float)w / (float)h, 0.1f, 100.0f);
-        glm::mat4 V = glm::lookAt(camPos, glm::vec3(0.0f, 0.3f, 0.0f), glm::vec3(0, 1, 0));
+        float yaw = glm::radians(camYawDeg);
+        float pitch = glm::radians(camPitchDeg);
 
-        glm::vec3 lightPos(100.0f, 25.0f, 16.0f);
+        glm::vec3 target(0.0f, 0.2f, 0.0f);
+        glm::vec3 camPos(
+            target.x + camDist * cosf(pitch) * sinf(yaw),
+            target.y + camDist * sinf(pitch),
+            target.z + camDist * cosf(pitch) * cosf(yaw)
+        );
 
-        glUseProgram(prog);
-        glUniformMatrix4fv(loc_uView, 1, GL_FALSE, glm::value_ptr(V));
-        glUniformMatrix4fv(loc_uProj, 1, GL_FALSE, glm::value_ptr(P));
+        glm::mat4 P = glm::perspective(glm::radians(60.0f), (float)w / (float)h, 0.1f, 200.0f);
+        glm::mat4 V = glm::lookAt(camPos, target, glm::vec3(0, 1, 0));
 
-        glUniform3fv(loc_uLightPosW, 1, glm::value_ptr(lightPos));
-        glUniform3fv(loc_uLightColor, 1, glm::value_ptr(lightColor));
-        glUniform3fv(loc_uCamPosW, 1, glm::value_ptr(camPos));
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, cubemapTex);
 
-        glUniform1f(loc_uLightIntensity, 8.0f);
-
-        glBindVertexArray(vao);
+        glUseProgram(glassProg);
+        glUniformMatrix4fv(g_uView,  1, GL_FALSE, glm::value_ptr(V));
+        glUniformMatrix4fv(g_uProj,  1, GL_FALSE, glm::value_ptr(P));
+        glUniform3fv(g_uCamPosW, 1, glm::value_ptr(camPos));
+        glUniform1f(g_uIOR, ior);
+        glUniform1f(g_uDisp, dispersion);
+        glUniform3fv(g_uTint, 1, glm::value_ptr(tint));
+        glUniform1f(g_uRefractStrength, refrStrength);
+        glUniform1f(g_uFresnelStrength, fresnelStrength);
 
         float t = (float)glfwGetTime();
-        const float omega = 0.8f;
 
-        for (int i = 0; i < 4; ++i) {
-            int modelType = i; // 0=Blinn,1=Toon,2=Oren,3=Cook
-            glUniform1i(loc_uModelType, modelType);
+        // ---- Draw test.obj ----
+        {
+            glm::mat4 M = glm::mat4(1.0f);
+            M = glm::translate(M, glm::vec3(0.0f, 0.0f, 0.0f));
+            M = glm::rotate(M, t * 0.8f, glm::vec3(0, 1, 0));
+            M = M * testMesh.baseModel;
 
-            glm::mat4 T = glm::translate(glm::mat4(1.0f), glm::vec3(offsets[i], 0.0f, 0.0f));
-            glm::mat4 R = glm::rotate(glm::mat4(1.0f), t * omega, glm::vec3(0, 1, 0));
-            glm::mat4 M = T * R * baseModel;
+            glUniformMatrix4fv(g_uModel, 1, GL_FALSE, glm::value_ptr(M));
+            glBindVertexArray(testMesh.vao);
+            glDrawElements(GL_TRIANGLES, testMesh.indexCount, GL_UNSIGNED_INT, 0);
+        }
 
-            glUniformMatrix4fv(loc_uModel, 1, GL_FALSE, glm::value_ptr(M));
+        // ---- Draw cap.obj ----
+        {
+            glm::mat4 M = glm::mat4(1.0f);
+            M = glm::translate(M, glm::vec3(-2.2f, 0.0f, 0.0f));
+            M = glm::rotate(M, -t * 0.5f, glm::vec3(0, 1, 0));
+            M = M * capMesh.baseModel;
 
-            MaterialUI& m = mats[i];
+            glUniformMatrix4fv(g_uModel, 1, GL_FALSE, glm::value_ptr(M));
+            glBindVertexArray(capMesh.vao);
+            glDrawElements(GL_TRIANGLES, capMesh.indexCount, GL_UNSIGNED_INT, 0);
+        }
 
-            glUniform3fv(loc_uAlbedo, 1, glm::value_ptr(m.albedo));
-            glUniform1f(loc_uKs, m.ks);
-            glUniform1f(loc_uShininess, m.shininess);
-            glUniform1f(loc_uRoughness, m.roughness);
-            glUniform1f(loc_uToonLevels, m.toonLevels);
+        // ---- Draw Moon.obj ----
+        {
+            glm::mat4 M = glm::mat4(1.0f);
+            M = glm::translate(M, glm::vec3(2.2f, 0.0f, 0.0f));
+            M = glm::rotate(M, t * 0.25f, glm::vec3(0, 1, 0));
+            M = M * moonMesh.baseModel;
 
-            glUniform1f(loc_uMetallic, m.metallic);
-            glUniform1f(loc_uAO, m.ao);
-            glUniform1f(loc_uRimStrength, m.rimStrength);
-            glUniform1f(loc_uSpecThreshold, m.specThreshold);
-
-            glDrawElements(GL_TRIANGLES, (GLsizei)indices.size(), GL_UNSIGNED_INT, 0);
+            glUniformMatrix4fv(g_uModel, 1, GL_FALSE, glm::value_ptr(M));
+            glBindVertexArray(moonMesh.vao);
+            glDrawElements(GL_TRIANGLES, moonMesh.indexCount, GL_UNSIGNED_INT, 0);
         }
 
         glBindVertexArray(0);
+
+        glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_FALSE);
+
+        glUseProgram(skyProg);
+
+        glm::mat4 Vsky = glm::mat4(glm::mat3(V));
+        glUniformMatrix4fv(s_uView, 1, GL_FALSE, glm::value_ptr(Vsky));
+        glUniformMatrix4fv(s_uProj, 1, GL_FALSE, glm::value_ptr(P));
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, cubemapTex);
+
+        glBindVertexArray(skyVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+        glBindVertexArray(0);
+
+        glDepthMask(GL_TRUE);
+        glDepthFunc(GL_LESS);
+
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
         glfwSwapBuffers(window);
     }
 
-    // ---- Cleanup ----
-    glDeleteProgram(prog);
-    glDeleteBuffers(1, &ebo);
-    glDeleteBuffers(1, &vbo);
-    glDeleteVertexArrays(1, &vao);
+    glDeleteProgram(glassProg);
+    glDeleteProgram(skyProg);
+
+    glDeleteTextures(1, &cubemapTex);
+
+    destroyMesh(testMesh);
+    destroyMesh(capMesh);
+    destroyMesh(moonMesh);
+
+    glDeleteBuffers(1, &skyVBO);
+    glDeleteVertexArrays(1, &skyVAO);
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();

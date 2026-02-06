@@ -8,7 +8,6 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 include(FetchContent)
 
-# ---- GLFW (build from source) ----
 FetchContent_Declare(
         glfw
         GIT_REPOSITORY https://github.com/glfw/glfw.git
@@ -19,7 +18,6 @@ set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(glfw)
 
-# ---- GLM (header-only) ----
 FetchContent_Declare(
         glm
         GIT_REPOSITORY https://github.com/g-truc/glm.git
@@ -27,7 +25,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glm)
 
-# ---- ASSIMP ----
 FetchContent_Declare(
         assimp
         GIT_REPOSITORY https://github.com/assimp/assimp.git
@@ -43,9 +40,9 @@ FetchContent_MakeAvailable(assimp)
 add_executable(app
         main.cpp
         external/glad/src/glad.c
+        external/stb/stb_image.cpp
 )
 
-# ---- Dear ImGui ----
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/external/imgui)
 
 target_sources(app PRIVATE
@@ -53,8 +50,6 @@ target_sources(app PRIVATE
         ${IMGUI_DIR}/imgui_draw.cpp
         ${IMGUI_DIR}/imgui_tables.cpp
         ${IMGUI_DIR}/imgui_widgets.cpp
-        # ${IMGUI_DIR}/imgui_demo.cpp   # optional
-
         ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp
         ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
 )
@@ -62,25 +57,19 @@ target_sources(app PRIVATE
 target_include_directories(app PRIVATE
         ${IMGUI_DIR}
         ${IMGUI_DIR}/backends
+
+        external/glad/include
+        external/stb
 )
 
-# Tell ImGui's OpenGL backend to use GLAD as the loader
 target_compile_definitions(app PRIVATE IMGUI_IMPL_OPENGL_LOADER_GLAD)
 
-# (Optional on macOS: silence OpenGL deprecation warnings)
 target_compile_definitions(app PRIVATE GL_SILENCE_DEPRECATION)
-
-
-target_include_directories(app PRIVATE
-        external/glad/include
-)
 
 target_compile_definitions(app PRIVATE ASSET_DIR="${CMAKE_SOURCE_DIR}/assets")
 
-# macOS OpenGL framework
 find_library(OPENGL_LIBRARY OpenGL)
 
-# Link everything here (after app exists)
 target_link_libraries(app PRIVATE
         glfw
         glm::glm
