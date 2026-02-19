@@ -27,7 +27,10 @@
 struct Vertex {
     float px, py, pz;
     float nx, ny, nz;
+    float u, v;
+    float tx, ty, tz, tw;
 };
+
 
 struct GPUMesh {
     GLuint vao = 0;
@@ -36,6 +39,25 @@ struct GPUMesh {
     GLsizei indexCount = 0;
     glm::mat4 baseModel = glm::mat4(1.0f);
 };
+
+struct TextureSet {
+    std::string name;
+    GLuint albedo = 0;
+    GLuint normal = 0;
+    GLuint height = 0;
+};
+
+static void bindTextureSet(const TextureSet& ts) {
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, ts.albedo);
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, ts.normal);
+
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, ts.height);
+}
+
 
 static void framebuffer_size_callback(GLFWwindow*, int w, int h) {
     glViewport(0, 0, w, h);
@@ -94,7 +116,8 @@ static void loadMergedMeshesAssimp(
     const unsigned int flags =
         aiProcess_Triangulate |
         aiProcess_JoinIdenticalVertices |
-        aiProcess_GenNormals |
+        aiProcess_GenSmoothNormals |
+        aiProcess_CalcTangentSpace |
         aiProcess_PreTransformVertices;
 
     const aiScene* scene = importer.ReadFile(path, flags);
@@ -114,8 +137,9 @@ static void loadMergedMeshesAssimp(
     size_t totalVerts = 0, totalIdx = 0;
     for (unsigned m = 0; m < scene->mNumMeshes; ++m) {
         totalVerts += scene->mMeshes[m]->mNumVertices;
-        for (unsigned f = 0; f < scene->mMeshes[m]->mNumFaces; ++f)
+        for (unsigned f = 0; f < scene->mMeshes[m]->mNumFaces; ++f) {
             totalIdx += scene->mMeshes[m]->mFaces[f].mNumIndices;
+        }
     }
     outVertices.reserve(totalVerts);
     outIndices.reserve(totalIdx);
@@ -126,13 +150,37 @@ static void loadMergedMeshesAssimp(
 
         for (unsigned i = 0; i < mesh->mNumVertices; ++i) {
             glm::vec3 p = aiToGlm(mesh->mVertices[i]);
-            glm::vec3 n = mesh->HasNormals() ? glm::normalize(aiToGlm(mesh->mNormals[i]))
-                                             : glm::vec3(0, 1, 0);
+            glm::vec3 n = mesh->HasNormals() ? glm::normalize(aiToGlm(mesh->mNormals[i])) : glm::vec3(0, 1, 0);
+
+            glm::vec2 uv(0.0f);
+            if (mesh->HasTextureCoords(0)) {
+                uv = glm::vec2(mesh->mTextureCoords[0][i].x, mesh->mTextureCoords[0][i].y);
+            }
+
+            glm::vec3 T(1.0f, 0.0f, 0.0f);
+            float sign = 1.0f;
+
+            if (mesh->HasTangentsAndBitangents()) {
+                T = aiToGlm(mesh->mTangents[i]);
+                glm::vec3 B = aiToGlm(mesh->mBitangents[i]);
+
+                T = glm::normalize(T - n * glm::dot(n, T));
+                sign = (glm::dot(glm::cross(n, T), B) < 0.0f) ? -1.0f : 1.0f;
+            } else {
+                if (fabsf(n.x) > 0.9f) T = glm::vec3(0, 0, 1);
+                T = glm::normalize(T - n * glm::dot(n, T));
+                sign = 1.0f;
+            }
 
             outMin = glm::min(outMin, p);
             outMax = glm::max(outMax, p);
 
-            outVertices.push_back(Vertex{p.x, p.y, p.z, n.x, n.y, n.z});
+            outVertices.push_back(Vertex{
+                p.x, p.y, p.z,
+                n.x, n.y, n.z,
+                uv.x, uv.y,
+                T.x, T.y, T.z, sign
+            });
         }
 
         for (unsigned f = 0; f < mesh->mNumFaces; ++f) {
@@ -170,22 +218,22 @@ static GPUMesh uploadMeshToGPU(const std::vector<Vertex>& vertices, const std::v
     glBindVertexArray(mesh.vao);
 
     glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
-    glBufferData(GL_ARRAY_BUFFER,
-                 (GLsizeiptr)(vertices.size() * sizeof(Vertex)),
-                 vertices.data(),
-                 GL_STATIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vertices.size() * sizeof(Vertex)), vertices.data(), GL_STATIC_DRAW);
 
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                 (GLsizeiptr)(indices.size() * sizeof(unsigned int)),
-                 indices.data(),
-                 GL_STATIC_DRAW);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(indices.size() * sizeof(unsigned int)), indices.data(), GL_STATIC_DRAW);
 
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, px));
 
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, nx));
+
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, u));
+
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, tx));
 
     glBindVertexArray(0);
     return mesh;
@@ -198,59 +246,52 @@ static void destroyMesh(GPUMesh& m) {
     m = GPUMesh{};
 }
 
-static GLuint loadCubemap(const std::array<std::string, 6>& faces)
-{
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, tex);
+static GLuint loadTexture2D(const std::string& path, bool flipY) {
+    stbi_set_flip_vertically_on_load(flipY ? 1 : 0);
 
-    stbi_set_flip_vertically_on_load(false);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-
-    int baseW = -1, baseH = -1;
-
-    for (GLuint i = 0; i < 6; ++i)
-    {
-        int w, h, n;
-        unsigned char* data = stbi_load(faces[i].c_str(), &w, &h, &n, 3); // force RGB
-
-        if (!data) {
-            std::cerr << "[Cubemap] FAIL face " << i << " : " << faces[i] << "\n"
-                      << "  reason: " << (stbi_failure_reason() ? stbi_failure_reason() : "(unknown)") << "\n";
-            throw std::runtime_error("Cubemap face failed to load.");
-        }
-
-        std::cerr << "[Cubemap] OK   face " << i << " : " << faces[i]
-                  << " (" << w << "x" << h << ", srcChannels=" << n << ", forced=3)\n";
-
-        if (i == 0) { baseW = w; baseH = h; }
-        if (w != baseW || h != baseH) {
-            stbi_image_free(data);
-            throw std::runtime_error("Cubemap faces must all be the same resolution.");
-        }
-
-        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i,
-                     0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
-
-        stbi_image_free(data);
-
-        GLenum err = glGetError();
-        if (err != GL_NO_ERROR) {
-            std::cerr << "[Cubemap] glTexImage2D error face " << i << " : 0x"
-                      << std::hex << err << std::dec << "\n";
-            throw std::runtime_error("OpenGL error uploading cubemap face.");
-        }
+    int w = 0, h = 0, comp = 0;
+    unsigned char* data = stbi_load(path.c_str(), &w, &h, &comp, 0);
+    if (!data) {
+        throw std::runtime_error("Failed to load texture: " + path);
     }
 
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    GLenum format = GL_RGB;
+    if (comp == 1) format = GL_RED;
+    else if (comp == 3) format = GL_RGB;
+    else if (comp == 4) format = GL_RGBA;
 
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
 
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glTexImage2D(GL_TEXTURE_2D, 0, (GLint)format, w, h, 0, format, GL_UNSIGNED_BYTE, data);
+    glGenerateMipmap(GL_TEXTURE_2D);
+
+    stbi_image_free(data);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return tex;
+}
+
+static GLuint make1x1RedTexture(unsigned char r) {
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 1, 1, 0, GL_RED, GL_UNSIGNED_BYTE, &r);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+
+    glBindTexture(GL_TEXTURE_2D, 0);
     return tex;
 }
 
@@ -265,12 +306,13 @@ int main() {
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 
-    GLFWwindow* window = glfwCreateWindow(1400, 720, "Lab 2 - Transmittance (Fresnel + Dispersion + Cubemap)", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1400, 720, "Realtime Rendering Assignment 3", nullptr, nullptr);
     if (!window) {
         std::cerr << "Failed to create GLFW window\n";
         glfwTerminate();
         return -1;
     }
+
     glfwMakeContextCurrent(window);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     glfwSwapInterval(1);
@@ -282,6 +324,8 @@ int main() {
         return -1;
     }
 
+    GLuint defaultHeightTex = make1x1RedTexture(128);
+
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
 
@@ -291,9 +335,9 @@ int main() {
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
 
-    const std::string testPath = std::string(ASSET_DIR) + "/test.obj";
-    const std::string capPath  = std::string(ASSET_DIR) + "/cap.obj";
-    const std::string moonPath = std::string(ASSET_DIR) + "/Moon.obj";
+    const std::string unicornPath = std::string(ASSET_DIR) + "/unicorn.glb";
+    const std::string horsePath   = std::string(ASSET_DIR) + "/horse/source/poly.glb";
+    const std::string moonPath    = std::string(ASSET_DIR) + "/moon/source/Moon.obj";
 
     auto loadOne = [&](const std::string& path, GPUMesh& outMesh) {
         std::vector<Vertex> v;
@@ -305,313 +349,273 @@ int main() {
         outMesh = uploadMeshToGPU(v, idx, base);
     };
 
-    GPUMesh testMesh, capMesh, moonMesh, staMesh;
+    GPUMesh unicornMesh, horseMesh, moonMesh;
     try {
-        loadOne(testPath, testMesh);
-        loadOne(capPath,  capMesh);
-        loadOne(moonPath, moonMesh);
+        loadOne(unicornPath, unicornMesh);
+        loadOne(horsePath,   horseMesh);
+        loadOne(moonPath,    moonMesh);
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\n";
-        destroyMesh(testMesh);
-        destroyMesh(capMesh);
+        destroyMesh(unicornMesh);
+        destroyMesh(horseMesh);
         destroyMesh(moonMesh);
         glfwDestroyWindow(window);
         glfwTerminate();
         return -1;
     }
 
-    // ---- Skybox geometry (cube) ----
-    float skyboxVerts[] = {
-        // back
-        -1.f,  1.f, -1.f,  -1.f, -1.f, -1.f,   1.f, -1.f, -1.f,
-         1.f, -1.f, -1.f,   1.f,  1.f, -1.f,  -1.f,  1.f, -1.f,
-        // left
-        -1.f, -1.f,  1.f,  -1.f, -1.f, -1.f,  -1.f,  1.f, -1.f,
-        -1.f,  1.f, -1.f,  -1.f,  1.f,  1.f,  -1.f, -1.f,  1.f,
-        // right
-         1.f, -1.f, -1.f,   1.f, -1.f,  1.f,   1.f,  1.f,  1.f,
-         1.f,  1.f,  1.f,   1.f,  1.f, -1.f,   1.f, -1.f, -1.f,
-        // front
-        -1.f, -1.f,  1.f,  -1.f,  1.f,  1.f,   1.f,  1.f,  1.f,
-         1.f,  1.f,  1.f,   1.f, -1.f,  1.f,  -1.f, -1.f,  1.f,
-        // top
-        -1.f,  1.f, -1.f,   1.f,  1.f, -1.f,   1.f,  1.f,  1.f,
-         1.f,  1.f,  1.f,  -1.f,  1.f,  1.f,  -1.f,  1.f, -1.f,
-        // bottom
-        -1.f, -1.f, -1.f,  -1.f, -1.f,  1.f,   1.f, -1.f,  1.f,
-         1.f, -1.f,  1.f,   1.f, -1.f, -1.f,  -1.f, -1.f, -1.f
-    };
-
-    GLuint skyVAO = 0, skyVBO = 0;
-    glGenVertexArrays(1, &skyVAO);
-    glGenBuffers(1, &skyVBO);
-    glBindVertexArray(skyVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, skyVBO);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(skyboxVerts), skyboxVerts, GL_STATIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
-    glBindVertexArray(0);
-
-    // ---- Load cubemap ----
-    const std::string skyDir = std::string(ASSET_DIR) + "/skybox";
-    std::array<std::string, 6> faces = {
-        skyDir + "/right.jpg",
-        skyDir + "/left.jpg",
-        skyDir + "/top.jpg",
-        skyDir + "/bottom.jpg",
-        skyDir + "/front.jpg",
-        skyDir + "/back.jpg"
-    };
-
-    GLuint cubemapTex = 0;
-    try {
-        cubemapTex = loadCubemap(faces);
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << "\n";
-        destroyMesh(testMesh);
-        destroyMesh(capMesh);
-        destroyMesh(moonMesh);
-        destroyMesh(staMesh);
-        glfwDestroyWindow(window);
-        glfwTerminate();
-        return -1;
-    }
-
-    // ---- Shaders ----
-    const char* glassVS = R"(
+    const char* basicVS = R"(
 #version 330 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNrm;
+layout(location=2) in vec2 aUV;
+layout(location=3) in vec4 aTan;
 
 uniform mat4 uModel;
 uniform mat4 uView;
 uniform mat4 uProj;
 
 out vec3 vPosW;
-out vec3 vNrmW;
+out vec2 vUV;
+out mat3 vTBN;
 
-void main() {
+void main(){
     vec4 posW = uModel * vec4(aPos, 1.0);
     vPosW = posW.xyz;
+    vUV = aUV;
 
     mat3 normalMat = transpose(inverse(mat3(uModel)));
-    vNrmW = normalize(normalMat * aNrm);
 
+    vec3 N = normalize(normalMat * aNrm);
+    vec3 T = normalize(normalMat * aTan.xyz);
+    T = normalize(T - N * dot(N, T));
+    vec3 B = aTan.w * normalize(cross(N, T));
+
+    vTBN = mat3(T, B, N);
     gl_Position = uProj * uView * posW;
 }
 )";
 
-    // UPDATED glassFS
-    const char* glassFS = R"(
+
+    const char* basicFS = R"(
 #version 330 core
 in vec3 vPosW;
-in vec3 vNrmW;
+in vec2 vUV;
+in mat3 vTBN;
 
 out vec4 FragColor;
 
-uniform samplerCube uEnvMap;
-uniform vec3  uCamPosW;
+uniform vec3 uCamPosW;
+uniform vec3 uLightDirW;
+uniform vec3 uAlbedoTint;
 
-uniform float uIOR;              // e.g. glass ~1.5, diamond ~2.42
-uniform float uDispersion;       // relative, try 0..0.2 (stylized)
-uniform vec3  uTint;
+uniform sampler2D uAlbedoTex;
+uniform sampler2D uNormalTex;
+uniform sampler2D uHeightTex;
 
-uniform float uRefractStrength;  // 0..1 (blend I -> refracted dir)
-uniform float uFresnelStrength;  // 0..1.5 (reduces/boosts reflection dominance)
+uniform int   uUseNormalMap;
+uniform int   uUseBumpMap;
 
-float saturate(float x){ return clamp(x, 0.0, 1.0); }
+uniform float uNormalStrength;
+uniform float uBumpStrength;
 
-vec3 srgbToLinear(vec3 c) {
-    return pow(max(c, vec3(0.0)), vec3(2.2));
+vec3 bumpNormalFromHeight()
+{
+    ivec2 ts = textureSize(uHeightTex, 0);
+    vec2 texel = 1.0 / vec2(max(ts, ivec2(1)));
+
+    float hL = texture(uHeightTex, vUV - vec2(texel.x, 0.0)).r;
+    float hR = texture(uHeightTex, vUV + vec2(texel.x, 0.0)).r;
+    float hD = texture(uHeightTex, vUV - vec2(0.0, texel.y)).r;
+    float hU = texture(uHeightTex, vUV + vec2(0.0, texel.y)).r;
+
+    vec2 g = vec2(hL - hR, hD - hU) * uBumpStrength;
+    return normalize(vec3(g.x, g.y, 1.0));
 }
 
-vec3 sampleEnvLinear(vec3 dir) {
-    vec3 c = texture(uEnvMap, dir).rgb;  // LDR cubemap assumed sRGB-ish
-    return srgbToLinear(c);              // convert to linear for mixing/lighting
-}
+void main(){
+    vec3 albedo = texture(uAlbedoTex, vUV).rgb * uAlbedoTint;
 
-void main() {
-    vec3 N = normalize(vNrmW);
-    vec3 V = normalize(uCamPosW - vPosW);   // frag -> camera
-    if (dot(N, V) < 0.0) N = -N;            // IMPORTANT: keep normal facing viewer
+    vec3 nTan = vec3(0.0, 0.0, 1.0);
 
-    vec3 I = -V;                            // camera -> frag
+    if (uUseNormalMap != 0) {
+        vec3 nTex = texture(uNormalTex, vUV).rgb;
+        vec3 nMap = normalize(nTex * 2.0 - 1.0);
+        nMap = normalize(mix(vec3(0.0, 0.0, 1.0), nMap, clamp(uNormalStrength, 0.0, 1.0)));
+        nTan = nMap;
+    }
 
-    // Reflection (linear)
-    vec3 R = reflect(I, N);
-    vec3 refl = sampleEnvLinear(R);
+    if (uUseBumpMap != 0) {
+        vec3 nBump = bumpNormalFromHeight();
+        nTan = (uUseNormalMap != 0)
+            ? normalize(vec3(nTan.xy + nBump.xy, nTan.z))
+            : nBump;
+    }
 
-    // Dispersion on eta (relative), not by adding/subtracting to IOR directly
-    float eta  = 1.0 / uIOR;
-    float etaR = eta * (1.0 - uDispersion);
-    float etaG = eta;
-    float etaB = eta * (1.0 + uDispersion);
+    vec3 N = normalize(vTBN * nTan);
+    vec3 L = normalize(uLightDirW);
+    vec3 V = normalize(uCamPosW - vPosW);
 
-    vec3 TrFull = refract(I, N, etaR);
-    vec3 TgFull = refract(I, N, etaG);
-    vec3 TbFull = refract(I, N, etaB);
+    float NdotL = max(dot(N, L), 0.0);
+    vec3 diffuse = albedo * NdotL;
 
-    // Handle total internal reflection: refract returns (0,0,0)
-    if (dot(TrFull, TrFull) < 1e-6) TrFull = R;
-    if (dot(TgFull, TgFull) < 1e-6) TgFull = R;
-    if (dot(TbFull, TbFull) < 1e-6) TbFull = R;
+    vec3 H = normalize(L + V);
+    float spec = pow(max(dot(N, H), 0.0), 64.0);
 
-    // Artistic control: blend between no-bend (I) and full refract
-    vec3 Tr = normalize(mix(I, TrFull, uRefractStrength));
-    vec3 Tg = normalize(mix(I, TgFull, uRefractStrength));
-    vec3 Tb = normalize(mix(I, TbFull, uRefractStrength));
-
-    // Refraction sampling (linear), but take R/G/B from different directions
-    vec3 refr;
-    refr.r = sampleEnvLinear(Tr).r;
-    refr.g = sampleEnvLinear(Tg).g;
-    refr.b = sampleEnvLinear(Tb).b;
-
-    refr *= uTint; // treat tint as linear multiplier
-
-    // Fresnel (Schlick)
-    float f0 = (uIOR - 1.0) / (uIOR + 1.0);
-    f0 = f0 * f0;
-
-    float cosTheta = saturate(dot(N, V));
-    float F = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
-
-    // Control how much reflection hides refraction/dispersion
-    F = clamp(F * uFresnelStrength, 0.0, 1.0);
-
-    // Mix in linear
-    vec3 col = mix(refr, refl, F);
-
-    // Simple tonemap + gamma for display
-    col = col / (col + vec3(1.0));
-    col = pow(max(col, vec3(0.0)), vec3(1.0/2.2));
+    vec3 ambient = 0.08 * albedo;
+    vec3 col = ambient + diffuse + 0.15 * spec;
 
     FragColor = vec4(col, 1.0);
 }
 )";
 
-    const char* skyVS = R"(
-#version 330 core
-layout(location=0) in vec3 aPos;
 
-out vec3 vDir;
-
-uniform mat4 uView;
-uniform mat4 uProj;
-
-void main() {
-    vDir = aPos;
-    vec4 p = uProj * uView * vec4(aPos, 1.0);
-    gl_Position = p.xyww;
-}
-)";
-
-    const char* skyFS = R"(
-#version 330 core
-in vec3 vDir;
-out vec4 FragColor;
-
-uniform samplerCube uEnvMap;
-
-void main() {
-    // keep as-is (your skybox is LDR JPG; this displays fine for the lab)
-    vec3 c = texture(uEnvMap, vDir).rgb;
-    c = pow(max(c, vec3(0.0)), vec3(1.0/2.2));
-    FragColor = vec4(c, 1.0);
-}
-)";
-
-    GLuint glassProg = 0, skyProg = 0;
+    GLuint basicProg = 0;
     try {
-        GLuint vs = compileShader(GL_VERTEX_SHADER, glassVS);
-        GLuint fs = compileShader(GL_FRAGMENT_SHADER, glassFS);
-        glassProg = linkProgram(vs, fs);
+        GLuint vs = compileShader(GL_VERTEX_SHADER, basicVS);
+        GLuint fs = compileShader(GL_FRAGMENT_SHADER, basicFS);
+        basicProg = linkProgram(vs, fs);
         glDeleteShader(vs);
         glDeleteShader(fs);
-
-        GLuint svs = compileShader(GL_VERTEX_SHADER, skyVS);
-        GLuint sfs = compileShader(GL_FRAGMENT_SHADER, skyFS);
-        skyProg = linkProgram(svs, sfs);
-        glDeleteShader(svs);
-        glDeleteShader(sfs);
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\n";
-        glDeleteTextures(1, &cubemapTex);
-        destroyMesh(testMesh);
-        destroyMesh(capMesh);
+        destroyMesh(unicornMesh);
+        destroyMesh(horseMesh);
         destroyMesh(moonMesh);
         glfwDestroyWindow(window);
         glfwTerminate();
         return -1;
     }
 
-    const GLint g_uModel    = glGetUniformLocation(glassProg, "uModel");
-    const GLint g_uView     = glGetUniformLocation(glassProg, "uView");
-    const GLint g_uProj     = glGetUniformLocation(glassProg, "uProj");
-    const GLint g_uEnvMap   = glGetUniformLocation(glassProg, "uEnvMap");
-    const GLint g_uCamPosW  = glGetUniformLocation(glassProg, "uCamPosW");
-    const GLint g_uIOR      = glGetUniformLocation(glassProg, "uIOR");
-    const GLint g_uDisp     = glGetUniformLocation(glassProg, "uDispersion");
-    const GLint g_uTint     = glGetUniformLocation(glassProg, "uTint");
+    const GLint b_uModel  = glGetUniformLocation(basicProg, "uModel");
+    const GLint b_uView   = glGetUniformLocation(basicProg, "uView");
+    const GLint b_uProj   = glGetUniformLocation(basicProg, "uProj");
+    const GLint b_uCamPos = glGetUniformLocation(basicProg, "uCamPosW");
+    const GLint b_uLight  = glGetUniformLocation(basicProg, "uLightDirW");
 
-    const GLint g_uRefractStrength = glGetUniformLocation(glassProg, "uRefractStrength");
-    const GLint g_uFresnelStrength = glGetUniformLocation(glassProg, "uFresnelStrength");
+    const GLint b_uAlbedoTint = glGetUniformLocation(basicProg, "uAlbedoTint");
+    const GLint b_uAlbedoTex  = glGetUniformLocation(basicProg, "uAlbedoTex");
+    const GLint b_uNormalTex  = glGetUniformLocation(basicProg, "uNormalTex");
+    const GLint b_uNormalStr  = glGetUniformLocation(basicProg, "uNormalStrength");
 
-    const GLint s_uView     = glGetUniformLocation(skyProg, "uView");
-    const GLint s_uProj     = glGetUniformLocation(skyProg, "uProj");
-    const GLint s_uEnvMap   = glGetUniformLocation(skyProg, "uEnvMap");
-
-    glUseProgram(glassProg);
-    glUniform1i(g_uEnvMap, 0);
-
-    glUseProgram(skyProg);
-    glUniform1i(s_uEnvMap, 0);
-
-    // ---- UI parameters ----
-    float ior = 1.50f;
-
-    float dispersion = 0.05f;
-
-    glm::vec3 tint(1.0f, 1.0f, 1.0f);
-
-    float refrStrength = 0.65f;
-    float fresnelStrength = 1.0f;
+    const GLint b_uHeightTex   = glGetUniformLocation(basicProg, "uHeightTex");
+    const GLint b_uUseNormal   = glGetUniformLocation(basicProg, "uUseNormalMap");
+    const GLint b_uUseBump     = glGetUniformLocation(basicProg, "uUseBumpMap");
+    const GLint b_uBumpStr     = glGetUniformLocation(basicProg, "uBumpStrength");
 
     float camYawDeg = 0.0f;
     float camPitchDeg = 10.0f;
-    float camDist = 6.0f;
+    float camDist = 3.0f;
+
+    bool showUnicorn = true;
+    bool showMoon = true;
+    bool showHorse = true;
+
+    GLuint albedoTex = 0;
+    GLuint normalTex = 0;
+
+    std::vector<TextureSet> texSets;
+    texSets.reserve(8);
+
+    try {
+        texSets.push_back(TextureSet{
+            "Moon(Normal Mapping Only)",
+            loadTexture2D(std::string(ASSET_DIR) + "/moon/textures/lroc_color_poles_1k.jpg", true),
+            loadTexture2D(std::string(ASSET_DIR) + "/moon/textures/ldisplacement.jpg", true),
+            defaultHeightTex
+        });
+
+        texSets.push_back(TextureSet{
+            "BronzeGrid-3",
+            loadTexture2D(std::string(ASSET_DIR) + "/textures/BronzeGrid_03_basecolor.jpg", true),
+            loadTexture2D(std::string(ASSET_DIR) + "/textures/BronzeGrid_03_normal.jpg", true),
+            loadTexture2D(std::string(ASSET_DIR) + "/textures/BronzeGrid_03_height.jpg", true)
+        });
+
+        texSets.push_back(TextureSet{
+            "BronzeGrid-1",
+            loadTexture2D(std::string(ASSET_DIR) + "/textures/BronzeGrid_01_basecolor.jpg", true),
+            loadTexture2D(std::string(ASSET_DIR) + "/textures/BronzeGrid_01_normal.jpg", true),
+            loadTexture2D(std::string(ASSET_DIR) + "/textures/BronzeGrid_01_height.jpg", true)
+        });
+
+        texSets.push_back(TextureSet{
+            "BronzeGrid-2",
+            loadTexture2D(std::string(ASSET_DIR) + "/textures/BronzeTiles_01_basecolor.jpg", true),
+            loadTexture2D(std::string(ASSET_DIR) + "/textures/BronzeTiles_01_normal.jpg", true),
+            loadTexture2D(std::string(ASSET_DIR) + "/textures/BronzeTiles_01_height.jpg", true)
+        });
+
+        texSets.push_back(TextureSet{
+            "MetalTiles",
+            loadTexture2D(std::string(ASSET_DIR) + "/textures/MetalTiles_01_basecolor.jpg", true),
+            loadTexture2D(std::string(ASSET_DIR) + "/textures/MetalTiles_01_normal.jpg", true),
+            loadTexture2D(std::string(ASSET_DIR) + "/textures/MetalTiles_01_height.jpg", true)
+        });
+
+
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\n";
+        glDeleteProgram(basicProg);
+        destroyMesh(unicornMesh);
+        destroyMesh(horseMesh);
+        destroyMesh(moonMesh);
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
+    }
+
+    std::vector<const char*> texSetNames;
+    texSetNames.reserve(texSets.size());
+    for (auto& s : texSets) texSetNames.push_back(s.name.c_str());
+
+    glUseProgram(basicProg);
+    glUniform1i(b_uAlbedoTex, 0);
+    glUniform1i(b_uNormalTex, 1);
+    glUniform1i(b_uHeightTex, 2);
+
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
             glfwSetWindowShouldClose(window, 1);
+        }
 
-        // ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::Begin("Lab 2 Controls");
-        ImGui::SliderFloat("IOR", &ior, 1.0f, 2.4f);
+        static bool useNormalMap = false;
+        static bool useBumpMap = false;
+        static float bumpStrength = 0.0f;
+        static float normalStrength = 0.0f;
+        static int activeSet = 0;
 
-        ImGui::SliderFloat("Dispersion", &dispersion, 0.0f, 0.20f);
-
-        ImGui::ColorEdit3("Tint", glm::value_ptr(tint));
-
-        ImGui::SliderFloat("Refract Strength", &refrStrength, 0.0f, 1.0f);
-        ImGui::SliderFloat("Fresnel Strength", &fresnelStrength, 0.0f, 1.5f);
-
+        ImGui::Begin("Assignment 3 Controls");
+        ImGui::Checkbox("Unicorn", &showUnicorn);
+        ImGui::Checkbox("Moon", &showMoon);
+        ImGui::Checkbox("Horse", &showHorse);
         ImGui::Separator();
         ImGui::SliderFloat("Cam Yaw (deg)", &camYawDeg, -180.0f, 180.0f);
         ImGui::SliderFloat("Cam Pitch (deg)", &camPitchDeg, -60.0f, 60.0f);
-        ImGui::SliderFloat("Cam Distance", &camDist, 2.0f, 20.0f);
-
+        ImGui::SliderFloat("Cam Distance", &camDist, 0.1f, 10.0f);
+        ImGui::Separator();
+        ImGui::Checkbox("Bump Mapping", &useBumpMap);
+        ImGui::Checkbox("Normal Mapping", &useNormalMap);
+        ImGui::SliderFloat("Bump Strength", &bumpStrength, 0.0f, 20.0f);
+        ImGui::SliderFloat("Normal Strength", &normalStrength, 0.0f, 1.0f);
+        ImGui::Combo("Texture Set (All)", &activeSet, texSetNames.data(), (int)texSetNames.size());
         ImGui::End();
 
         int w = 0, h = 0;
         glfwGetFramebufferSize(window, &w, &h);
-        if (w <= 0 || h <= 0) continue;
+        if (w <= 0 || h <= 0) {
+            ImGui::Render();
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            glfwSwapBuffers(window);
+            continue;
+        }
 
         glViewport(0, 0, w, h);
         glClearColor(0.08f, 0.09f, 0.11f, 1.0f);
@@ -630,99 +634,86 @@ void main() {
         glm::mat4 P = glm::perspective(glm::radians(60.0f), (float)w / (float)h, 0.1f, 200.0f);
         glm::mat4 V = glm::lookAt(camPos, target, glm::vec3(0, 1, 0));
 
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_CUBE_MAP, cubemapTex);
+        glm::vec3 lightDirW = glm::normalize(glm::vec3(0.6f, 1.0f, 0.3f));
 
-        glUseProgram(glassProg);
-        glUniformMatrix4fv(g_uView,  1, GL_FALSE, glm::value_ptr(V));
-        glUniformMatrix4fv(g_uProj,  1, GL_FALSE, glm::value_ptr(P));
-        glUniform3fv(g_uCamPosW, 1, glm::value_ptr(camPos));
-        glUniform1f(g_uIOR, ior);
-        glUniform1f(g_uDisp, dispersion);
-        glUniform3fv(g_uTint, 1, glm::value_ptr(tint));
-        glUniform1f(g_uRefractStrength, refrStrength);
-        glUniform1f(g_uFresnelStrength, fresnelStrength);
+        glUseProgram(basicProg);
+
+        glUniformMatrix4fv(b_uView, 1, GL_FALSE, glm::value_ptr(V));
+        glUniformMatrix4fv(b_uProj, 1, GL_FALSE, glm::value_ptr(P));
+        glUniform3fv(b_uCamPos, 1, glm::value_ptr(camPos));
+        glUniform3fv(b_uLight, 1, glm::value_ptr(lightDirW));
+
+        bindTextureSet(texSets[activeSet]);
+        glUniform1f(b_uNormalStr, normalStrength);
+
+        glUniform1i(b_uUseNormal, useNormalMap ? 1 : 0);
+        glUniform1i(b_uUseBump,   useBumpMap ? 1 : 0);
+        glUniform1f(b_uBumpStr, bumpStrength);
 
         float t = (float)glfwGetTime();
 
-        // ---- Draw test.obj ----
-        {
-            glm::mat4 M = glm::mat4(1.0f);
-            M = glm::translate(M, glm::vec3(0.0f, 0.0f, 0.0f));
-            M = glm::rotate(M, t * 0.8f, glm::vec3(0, 1, 0));
-            M = M * testMesh.baseModel;
-
-            glUniformMatrix4fv(g_uModel, 1, GL_FALSE, glm::value_ptr(M));
-            glBindVertexArray(testMesh.vao);
-            glDrawElements(GL_TRIANGLES, testMesh.indexCount, GL_UNSIGNED_INT, 0);
-        }
-
-        // ---- Draw cap.obj ----
-        {
-            glm::mat4 M = glm::mat4(1.0f);
+        if (showUnicorn) {
+            glm::mat4 M(1.0f);
             M = glm::translate(M, glm::vec3(-2.2f, 0.0f, 0.0f));
-            M = glm::rotate(M, -t * 0.5f, glm::vec3(0, 1, 0));
-            M = M * capMesh.baseModel;
+            M = glm::rotate(M, t * 0.6f, glm::vec3(0, 1, 0));
+            M = M * unicornMesh.baseModel;
 
-            glUniformMatrix4fv(g_uModel, 1, GL_FALSE, glm::value_ptr(M));
-            glBindVertexArray(capMesh.vao);
-            glDrawElements(GL_TRIANGLES, capMesh.indexCount, GL_UNSIGNED_INT, 0);
+            glUniformMatrix4fv(b_uModel, 1, GL_FALSE, glm::value_ptr(M));
+            glUniform3f(b_uAlbedoTint, 0.85f, 0.75f, 0.95f);
+
+            glBindVertexArray(unicornMesh.vao);
+            glDrawElements(GL_TRIANGLES, unicornMesh.indexCount, GL_UNSIGNED_INT, 0);
         }
 
-        // ---- Draw Moon.obj ----
-        {
-            glm::mat4 M = glm::mat4(1.0f);
-            M = glm::translate(M, glm::vec3(2.2f, 0.0f, 0.0f));
-            M = glm::rotate(M, t * 0.25f, glm::vec3(0, 1, 0));
+        if (showMoon) {
+            glm::mat4 M(1.0f);
+            M = glm::translate(M, glm::vec3(0.0f, 0.0f, 0.0f));
+            M = glm::rotate(M, t * 0.3f, glm::vec3(0, 1, 0));
             M = M * moonMesh.baseModel;
 
-            glUniformMatrix4fv(g_uModel, 1, GL_FALSE, glm::value_ptr(M));
+            glUniformMatrix4fv(b_uModel, 1, GL_FALSE, glm::value_ptr(M));
+            glUniform3f(b_uAlbedoTint, 0.75f, 0.75f, 0.75f);
+
             glBindVertexArray(moonMesh.vao);
             glDrawElements(GL_TRIANGLES, moonMesh.indexCount, GL_UNSIGNED_INT, 0);
         }
 
+        if (showHorse) {
+            glm::mat4 M(1.0f);
+            M = glm::translate(M, glm::vec3(2.2f, 0.0f, 0.0f));
+            M = glm::rotate(M, -t * 0.45f, glm::vec3(0, 1, 0));
+            M = M * horseMesh.baseModel;
+
+            glUniformMatrix4fv(b_uModel, 1, GL_FALSE, glm::value_ptr(M));
+            glUniform3f(b_uAlbedoTint, 0.80f, 0.70f, 0.60f);
+
+            glBindVertexArray(horseMesh.vao);
+            glDrawElements(GL_TRIANGLES, horseMesh.indexCount, GL_UNSIGNED_INT, 0);
+        }
+
         glBindVertexArray(0);
-
-        glDepthFunc(GL_LEQUAL);
-        glDepthMask(GL_FALSE);
-
-        glUseProgram(skyProg);
-
-        glm::mat4 Vsky = glm::mat4(glm::mat3(V));
-        glUniformMatrix4fv(s_uView, 1, GL_FALSE, glm::value_ptr(Vsky));
-        glUniformMatrix4fv(s_uProj, 1, GL_FALSE, glm::value_ptr(P));
-
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_CUBE_MAP, cubemapTex);
-
-        glBindVertexArray(skyVAO);
-        glDrawArrays(GL_TRIANGLES, 0, 36);
-        glBindVertexArray(0);
-
-        glDepthMask(GL_TRUE);
-        glDepthFunc(GL_LESS);
 
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
         glfwSwapBuffers(window);
     }
 
-    glDeleteProgram(glassProg);
-    glDeleteProgram(skyProg);
+    glDeleteProgram(basicProg);
 
-    glDeleteTextures(1, &cubemapTex);
-
-    destroyMesh(testMesh);
-    destroyMesh(capMesh);
+    destroyMesh(unicornMesh);
+    destroyMesh(horseMesh);
     destroyMesh(moonMesh);
-
-    glDeleteBuffers(1, &skyVBO);
-    glDeleteVertexArrays(1, &skyVAO);
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
+
+    for (auto& s : texSets) {
+        if (s.albedo) glDeleteTextures(1, &s.albedo);
+        if (s.normal) glDeleteTextures(1, &s.normal);
+        if (s.height && s.height != defaultHeightTex) glDeleteTextures(1, &s.height);
+    }
+    if (defaultHeightTex) glDeleteTextures(1, &defaultHeightTex);
 
     glfwDestroyWindow(window);
     glfwTerminate();
