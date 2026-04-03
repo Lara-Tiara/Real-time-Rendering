@@ -1,0 +1,11 @@
+Model Information:
+* title:	Cloth On Cup
+* source:	https://sketchfab.com/3d-models/cloth-on-cup-cf9b947f296442a0a3d0830be3520ff7
+* author:	blackSCORPIO (https://sketchfab.com/blackSCORPIO)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Cloth On Cup" (https://sketchfab.com/3d-models/cloth-on-cup-cf9b947f296442a0a3d0830be3520ff7) by blackSCORPIO (https://sketchfab.com/blackSCORPIO) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

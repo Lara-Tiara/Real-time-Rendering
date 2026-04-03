@@ -1,0 +1,11 @@
+Model Information:
+* title:	Cloth Ghost
+* source:	https://sketchfab.com/3d-models/cloth-ghost-f4fc1cd448c04a809d106975cfa7011b
+* author:	ANDRE (https://sketchfab.com/andrey.sk)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Cloth Ghost" (https://sketchfab.com/3d-models/cloth-ghost-f4fc1cd448c04a809d106975cfa7011b) by ANDRE (https://sketchfab.com/andrey.sk) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

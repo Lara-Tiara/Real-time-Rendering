@@ -1,0 +1,8 @@
+//
+// Created by Yang on 2026/4/3.
+//
+
+#ifndef OPENGL_CLION_CLOTHMATERIAL_H
+#define OPENGL_CLION_CLOTHMATERIAL_H
+
+#endif //OPENGL_CLION_CLOTHMATERIAL_H
