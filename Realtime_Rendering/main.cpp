@@ -22,6 +22,7 @@
 
 struct MaterialSet {
     std::string name;
+    float localAnisotropyScale = 1.0f;
     std::unique_ptr<Texture> diffuse;
     std::unique_ptr<Texture> roughness;
     std::unique_ptr<Texture> ao;
@@ -34,6 +35,19 @@ struct ModelEntry {
     std::string name;
     std::unique_ptr<Model> model;
     std::vector<int> meshIndices;
+    float uvScale = 1.0f;
+    int materialIndex = 0;
+    float aoStrength = 1.0f;
+    float anisotropyScale = 1.0f;
+};
+
+struct ClothPreset {
+    std::string name;
+    std::string folder;
+    std::string prefix;
+    std::string modelRelativePath;
+    std::vector<int> meshIndices;
+    float defaultUvScale = 1.0f;
 };
 
 static void framebufferSizeCallback(GLFWwindow* window, int width, int height) {
@@ -50,20 +64,144 @@ static std::string assetPath(const std::string& relative) {
     return std::string(ASSET_DIR) + "/" + relative;
 }
 
-static MaterialSet loadClothMaterial(const std::string& displayName, const std::string& folder, const std::string& prefix) {
+static GLuint compileRawShader(GLenum type, const char* source) {
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+
+    GLint ok = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        GLint len = 0;
+        glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &len);
+        std::string log(static_cast<size_t>(len > 0 ? len : 1), '\0');
+        glGetShaderInfoLog(shader, len, nullptr, log.data());
+        glDeleteShader(shader);
+        throw std::runtime_error("Skybox shader compilation failed:\n" + log);
+    }
+
+    return shader;
+}
+
+static GLuint linkRawProgram(GLuint vs, GLuint fs) {
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glLinkProgram(program);
+
+    GLint ok = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        GLint len = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &len);
+        std::string log(static_cast<size_t>(len > 0 ? len : 1), '\0');
+        glGetProgramInfoLog(program, len, nullptr, log.data());
+        glDeleteProgram(program);
+        throw std::runtime_error("Skybox program link failed:\n" + log);
+    }
+
+    return program;
+}
+
+
+static MaterialSet loadMaterialSet(
+    const std::string& displayName,
+    float localAnisotropyScale,
+    const std::string& diffusePath,
+    const std::string& roughnessPath,
+    const std::string& aoPath,
+    const std::string& normalPath,
+    const std::string& anisoRotationPath,
+    const std::string& anisoStrengthPath
+) {
     MaterialSet material;
     material.name = displayName;
+    material.localAnisotropyScale = localAnisotropyScale;
 
-    const std::string base = assetPath("textures/cloth/" + folder + "/");
-
-    material.diffuse = std::make_unique<Texture>(base + prefix + "_diff_4k.png", TextureColorSpace::SRGB, true);
-    material.roughness = std::make_unique<Texture>(base + prefix + "_rough_4k.png", TextureColorSpace::Linear, true);
-    material.ao = std::make_unique<Texture>(base + prefix + "_ao_4k.png", TextureColorSpace::Linear, true);
-    material.normalGL = std::make_unique<Texture>(base + prefix + "_nor_gl_4k.png", TextureColorSpace::Linear, true);
-    material.anisoRotation = std::make_unique<Texture>(base + prefix + "_anisotropy_rotation_4k.png", TextureColorSpace::Linear, true);
-    material.anisoStrength = std::make_unique<Texture>(base + prefix + "_anisotropy_strength_4k.png", TextureColorSpace::Linear, true);
+    material.diffuse = std::make_unique<Texture>(assetPath(diffusePath), TextureColorSpace::SRGB, true);
+    material.roughness = std::make_unique<Texture>(assetPath(roughnessPath), TextureColorSpace::Linear, true);
+    material.ao = std::make_unique<Texture>(assetPath(aoPath), TextureColorSpace::Linear, true);
+    material.normalGL = std::make_unique<Texture>(assetPath(normalPath), TextureColorSpace::Linear, true);
+    material.anisoRotation = std::make_unique<Texture>(assetPath(anisoRotationPath), TextureColorSpace::Linear, true);
+    material.anisoStrength = std::make_unique<Texture>(assetPath(anisoStrengthPath), TextureColorSpace::Linear, true);
 
     return material;
+}
+
+static std::vector<MaterialSet> loadMaterialVariants(const ClothPreset& cloth) {
+    const std::string base = "textures/cloth/" + cloth.folder + "/";
+
+    std::vector<MaterialSet> materials;
+    materials.push_back(loadMaterialSet(
+        "Reference",
+        1.0f,
+        base + cloth.prefix + "_diff_4k.png",
+        base + cloth.prefix + "_rough_4k.png",
+        base + cloth.prefix + "_ao_4k.png",
+        base + cloth.prefix + "_nor_gl_4k.png",
+        base + cloth.prefix + "_anisotropy_rotation_4k.png",
+        base + cloth.prefix + "_anisotropy_strength_4k.png"
+    ));
+
+    materials.push_back(loadMaterialSet(
+        "Generated",
+        1.0f,
+        base + cloth.prefix + "_diff_4k.png",
+        base + cloth.prefix + "_rough_4k.png",
+        base + cloth.prefix + "_ao_4k.png",
+        base + cloth.prefix + "_nor_gl_4k.png",
+        base + "generated/reconstructed_anisotropy_rotation.png",
+        base + "generated/reconstructed_anisotropy_strength.png"
+    ));
+
+    materials.push_back(loadMaterialSet(
+        "Baseline",
+        0.0f,
+        base + cloth.prefix + "_diff_4k.png",
+        base + cloth.prefix + "_rough_4k.png",
+        base + cloth.prefix + "_ao_4k.png",
+        base + cloth.prefix + "_nor_gl_4k.png",
+        base + cloth.prefix + "_anisotropy_rotation_4k.png",
+        base + cloth.prefix + "_anisotropy_strength_4k.png"
+    ));
+
+    return materials;
+}
+
+static std::vector<ModelEntry> buildDisplayModels(const ClothPreset& cloth) {
+    std::vector<ModelEntry> models;
+
+    models.push_back({
+        "Left Mesh",
+        std::make_unique<Model>(assetPath(cloth.modelRelativePath)),
+        cloth.meshIndices,
+        cloth.defaultUvScale,
+        0,
+        1.0f,
+        1.0f
+    });
+
+    models.push_back({
+        "Center Mesh",
+        std::make_unique<Model>(assetPath(cloth.modelRelativePath)),
+        cloth.meshIndices,
+        cloth.defaultUvScale,
+        1,
+        1.0f,
+        1.0f
+    });
+
+    models.push_back({
+        "Right Mesh",
+        std::make_unique<Model>(assetPath(cloth.modelRelativePath)),
+        cloth.meshIndices,
+        cloth.defaultUvScale,
+        2,
+        1.0f,
+        1.0f
+    });
+
+    return models;
 }
 
 static glm::vec3 directionFromAngles(float elevationDeg, float azimuthDeg) {
@@ -122,49 +260,95 @@ int main() {
             assetPath("shaders/cloth_reference.frag")
         );
 
-        std::vector<MaterialSet> materials;
-        materials.push_back(loadClothMaterial("Crepe Satin", "crepe_satin", "crepe_satin"));
-        materials.push_back(loadClothMaterial("Hessian 230", "hessian_230", "hessian_230"));
-        materials.push_back(loadClothMaterial("Gingham Check", "gingham_check", "gingham_check"));
+        const char* skyboxVS = R"(
+#version 330 core
+layout(location = 0) in vec3 aPos;
+out vec3 vTexDir;
+uniform mat4 uView;
+uniform mat4 uProj;
+void main() {
+    vTexDir = aPos;
+    vec4 pos = uProj * uView * vec4(aPos, 1.0);
+    gl_Position = pos.xyww;
+}
+)";
 
-        std::vector<ModelEntry> models;
+        const char* skyboxFS = R"(
+#version 330 core
+in vec3 vTexDir;
+out vec4 FragColor;
+uniform samplerCube uSkybox;
+void main() {
+    FragColor = texture(uSkybox, vTexDir);
+}
+)";
 
-        // models.push_back({
-        //     "Curtain Flannel",
-        //     std::make_unique<Model>(assetPath("models/curtain_flannel/scene.gltf")),
-        //     {}
-        // });
+        GLuint skyboxProgram = 0;
+        GLuint skyboxVAO = 0;
+        GLuint skyboxVBO = 0;
+        GLuint skyboxCubemap = 0;
 
-        models.push_back({
-            "Cloth On Cup",
-            std::make_unique<Model>(assetPath("models/cloth_on_cup/scene.gltf")),
-            {0}
+        {
+            GLuint vs = compileRawShader(GL_VERTEX_SHADER, skyboxVS);
+            GLuint fs = compileRawShader(GL_FRAGMENT_SHADER, skyboxFS);
+            skyboxProgram = linkRawProgram(vs, fs);
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+
+
+            const std::vector<std::string> skyboxFaces = {
+                assetPath("textures/skybox/right.jpg"),
+                assetPath("textures/skybox/left.jpg"),
+                assetPath("textures/skybox/top.jpg"),
+                assetPath("textures/skybox/bottom.jpg"),
+                assetPath("textures/skybox/front.jpg"),
+                assetPath("textures/skybox/back.jpg")
+            };
+
+
+            glUseProgram(skyboxProgram);
+            glUniform1i(glGetUniformLocation(skyboxProgram, "uSkybox"), 0);
+        }
+
+        std::vector<ClothPreset> clothPresets;
+        clothPresets.push_back({
+            "Crepe Satin",
+            "crepe_satin",
+            "crepe_satin",
+            "models/crepe_satin_4k/crepe_satin_4k.gltf",
+            {0},
+            1.0f
+        });
+        clothPresets.push_back({
+            "Gingham Check",
+            "gingham_check",
+            "gingham_check",
+            "models/gingham_check_4k/gingham_check_4k.gltf",
+            {0},
+            1.0f
+        });
+        clothPresets.push_back({
+            "Hessian 230",
+            "hessian_230",
+            "hessian_230",
+            "models/hessian_230_4k/hessian_230_4k.gltf",
+            {0},
+            1.0f
         });
 
-        models.push_back({
-            "Cloth Ghost",
-            std::make_unique<Model>(assetPath("models/cloth_ghost/scene.gltf")),
-            {0}
-        });
-
-        models.push_back({
-            "Crepe Satin Cloth",
-            std::make_unique<Model>(assetPath("models/crepe_satin_4k/crepe_satin_4k.gltf")),
-            {0}
-        });
+        int currentClothIndex = 0;
+        std::vector<MaterialSet> materials = loadMaterialVariants(clothPresets[currentClothIndex]);
+        std::vector<ModelEntry> models = buildDisplayModels(clothPresets[currentClothIndex]);
 
         for (const auto& entry : models) {
             entry.model->printMeshInfo();
         }
 
-        int currentMaterialIndex = 0;
         int debugView = 0;
 
-        float uvScale = 1.0f;
+        float globalUvScale = 1.0f;
         float normalScale = 1.0f;
         float roughnessScale = 1.0f;
-        float aoStrength = 1.0f;
-        float anisotropyScale = 1.0f;
 
         float cameraDistance = 5.2f;
         float modelScale = 1.0f;
@@ -185,6 +369,18 @@ int main() {
             "Strength"
         };
 
+        const char* materialItems[] = {
+            "Reference",
+            "Generated",
+            "Baseline"
+        };
+
+        const char* clothItems[] = {
+            "Crepe Satin",
+            "Gingham Check",
+            "Hessian 230"
+        };
+
         while (!glfwWindowShouldClose(window)) {
             processInput(window);
             glfwPollEvents();
@@ -195,29 +391,51 @@ int main() {
 
             ImGui::Begin("Cloth Viewer");
 
-            if (ImGui::BeginCombo("Material", materials[currentMaterialIndex].name.c_str())) {
-                for (int i = 0; i < static_cast<int>(materials.size()); ++i) {
-                    const bool selected = (i == currentMaterialIndex);
-                    if (ImGui::Selectable(materials[i].name.c_str(), selected)) {
-                        currentMaterialIndex = i;
-                    }
-                    if (selected) {
-                        ImGui::SetItemDefaultFocus();
-                    }
+            if (ImGui::Combo("Cloth", &currentClothIndex, clothItems, IM_ARRAYSIZE(clothItems))) {
+                materials = loadMaterialVariants(clothPresets[currentClothIndex]);
+                models = buildDisplayModels(clothPresets[currentClothIndex]);
+                for (const auto& entry : models) {
+                    entry.model->printMeshInfo();
                 }
-                ImGui::EndCombo();
             }
 
+            ImGui::Text("Three identical meshes with switchable Reference / Generated / Baseline variants.");
+            ImGui::Text("Current cloth folder: %s", clothPresets[currentClothIndex].folder.c_str());
             ImGui::Combo("Debug View", &debugView, debugItems, IM_ARRAYSIZE(debugItems));
 
-            ImGui::SliderFloat("UV Scale", &uvScale, 0.1f, 16.0f);
-            ImGui::SliderFloat("Normal Scale", &normalScale, 0.0f, 3.0f);
-            ImGui::SliderFloat("Roughness Scale", &roughnessScale, 0.1f, 3.0f);
-            ImGui::SliderFloat("AO Strength", &aoStrength, 0.0f, 1.0f);
-            ImGui::SliderFloat("Anisotropy Scale", &anisotropyScale, 0.0f, 3.0f);
+            ImGui::Separator();
+            ImGui::Text("Material Variant Per Mesh");
+            for (int i = 0; i < static_cast<int>(models.size()); ++i) {
+                std::string comboLabel = models[i].name + " Material";
+                ImGui::Combo(comboLabel.c_str(), &models[i].materialIndex, materialItems, IM_ARRAYSIZE(materialItems));
+            }
 
             ImGui::Separator();
+            ImGui::SliderFloat("Global UV Scale", &globalUvScale, 0.001f, 16.0f, "%.4f", ImGuiSliderFlags_Logarithmic);
+            ImGui::Text("Per-Mesh UV Scale");
+            for (int i = 0; i < static_cast<int>(models.size()); ++i) {
+                std::string label = models[i].name + " UV";
+                ImGui::SliderFloat(label.c_str(), &models[i].uvScale, 0.001f, 4.0f, "%.4f", ImGuiSliderFlags_Logarithmic);
+            }
 
+            ImGui::Separator();
+            ImGui::SliderFloat("Normal Scale", &normalScale, 0.0f, 3.0f);
+            ImGui::SliderFloat("Roughness Scale", &roughnessScale, 0.1f, 3.0f);
+
+            ImGui::Separator();
+            ImGui::Text("Per-Mesh AO Strength");
+            for (int i = 0; i < static_cast<int>(models.size()); ++i) {
+                std::string label = models[i].name + " AO";
+                ImGui::SliderFloat(label.c_str(), &models[i].aoStrength, 0.0f, 1.0f);
+            }
+
+            ImGui::Text("Per-Mesh Anisotropy Scale");
+            for (int i = 0; i < static_cast<int>(models.size()); ++i) {
+                std::string label = models[i].name + " Anisotropy";
+                ImGui::SliderFloat(label.c_str(), &models[i].anisotropyScale, 0.0f, 10.0f);
+            }
+
+            ImGui::Separator();
             ImGui::SliderFloat("Camera Distance", &cameraDistance, 2.0f, 12.0f);
             ImGui::SliderFloat("Model Scale", &modelScale, 0.1f, 3.0f);
             ImGui::SliderFloat("Model Yaw Offset", &modelYawOffset, -180.0f, 180.0f);
@@ -225,14 +443,19 @@ int main() {
             ImGui::SliderFloat("Model Spacing", &modelSpacing, 0.5f, 6.0f);
 
             ImGui::Separator();
-
             ImGui::SliderFloat("Light Elevation", &lightElevation, -85.0f, 85.0f);
             ImGui::SliderFloat("Light Azimuth", &lightAzimuth, -180.0f, 180.0f);
 
-            ImGui::Text("Current Material: %s", materials[currentMaterialIndex].name.c_str());
-            ImGui::Text("Models:");
+            ImGui::Separator();
+            ImGui::Text("Current assignments:");
             for (const auto& modelEntry : models) {
-                ImGui::BulletText("%s", modelEntry.name.c_str());
+                ImGui::BulletText(
+                    "%s -> %s | AO %.2f | Aniso %.2f",
+                    modelEntry.name.c_str(),
+                    materials[modelEntry.materialIndex].name.c_str(),
+                    modelEntry.aoStrength,
+                    modelEntry.anisotropyScale
+                );
             }
 
             ImGui::End();
@@ -249,26 +472,18 @@ int main() {
             glm::vec3 lightDir = directionFromAngles(lightElevation, lightAzimuth);
             glm::vec3 lightColor(3.0f, 3.0f, 3.0f);
 
-            const MaterialSet& material = materials[currentMaterialIndex];
-
             glViewport(0, 0, fbWidth, fbHeight);
             glClearColor(0.08f, 0.09f, 0.11f, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
             clothShader.use();
-
             clothShader.setMat4("uView", view);
             clothShader.setMat4("uProj", proj);
-
             clothShader.setVec3("uCameraPos", cameraPos);
             clothShader.setVec3("uLightDir", lightDir);
             clothShader.setVec3("uLightColor", lightColor);
-
-            clothShader.setFloat("uUvScale", uvScale);
             clothShader.setFloat("uNormalScale", normalScale);
             clothShader.setFloat("uRoughnessScale", roughnessScale);
-            clothShader.setFloat("uAoStrength", aoStrength);
-            clothShader.setFloat("uAnisotropyScale", anisotropyScale);
             clothShader.setInt("uDebugView", debugView);
 
             clothShader.setInt("uDiffuseMap", 0);
@@ -278,13 +493,6 @@ int main() {
             clothShader.setInt("uAnisoRotationMap", 4);
             clothShader.setInt("uAnisoStrengthMap", 5);
 
-            material.diffuse->bind(0);
-            material.roughness->bind(1);
-            material.ao->bind(2);
-            material.normalGL->bind(3);
-            material.anisoRotation->bind(4);
-            material.anisoStrength->bind(5);
-
             const float timeSeconds = static_cast<float>(glfwGetTime());
             const float sharedYaw = modelYawOffset + rotationSpeed * timeSeconds;
 
@@ -292,7 +500,19 @@ int main() {
             const float centerOffset = 0.5f * static_cast<float>(modelCount - 1);
 
             for (int i = 0; i < modelCount; ++i) {
-                const Model& modelRef = *models[i].model;
+                const ModelEntry& entry = models[i];
+                const MaterialSet& material = materials[entry.materialIndex];
+                const Model& modelRef = *entry.model;
+
+                material.diffuse->bind(0);
+                material.roughness->bind(1);
+                material.ao->bind(2);
+                material.normalGL->bind(3);
+                material.anisoRotation->bind(4);
+                material.anisoStrength->bind(5);
+
+                clothShader.setFloat("uAoStrength", entry.aoStrength);
+                clothShader.setFloat("uAnisotropyScale", entry.anisotropyScale * material.localAnisotropyScale);
 
                 const glm::vec3 center = modelRef.center();
                 const float radius = modelRef.radius();
@@ -308,8 +528,27 @@ int main() {
                 model = glm::translate(model, -center);
 
                 clothShader.setMat4("uModel", model);
-                models[i].model->drawMeshIndices(models[i].meshIndices);
+                clothShader.setFloat("uUvScale", globalUvScale * entry.uvScale);
+
+                entry.model->drawMeshIndices(entry.meshIndices);
             }
+
+            glDepthFunc(GL_LEQUAL);
+            glDepthMask(GL_FALSE);
+
+            glUseProgram(skyboxProgram);
+            glm::mat4 skyboxView = glm::mat4(glm::mat3(view));
+            glUniformMatrix4fv(glGetUniformLocation(skyboxProgram, "uView"), 1, GL_FALSE, glm::value_ptr(skyboxView));
+            glUniformMatrix4fv(glGetUniformLocation(skyboxProgram, "uProj"), 1, GL_FALSE, glm::value_ptr(proj));
+
+            glBindVertexArray(skyboxVAO);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, skyboxCubemap);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+            glBindVertexArray(0);
+
+            glDepthMask(GL_TRUE);
+            glDepthFunc(GL_LESS);
 
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
